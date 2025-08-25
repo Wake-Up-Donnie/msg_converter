@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EML to PDF Converter</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            padding: 40px;
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2.5rem;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 40px;
+            font-size: 1.1rem;
+        }
+
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 12px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-bottom: 30px;
+            background: #f8f9ff;
+        }
+
+        .upload-area:hover {
+            border-color: #5a67d8;
+            background: #f0f4ff;
+        }
+
+        .upload-area.dragover {
+            border-color: #4c51bf;
+            background: #e6f3ff;
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 4rem;
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+
+        .upload-text {
+            font-size: 1.3rem;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .upload-subtext {
+            color: #666;
+            font-size: 1rem;
+        }
+
+        #file-input {
+            display: none;
+        }
+
+        .file-list {
+            margin: 30px 0;
+        }
+
+        .file-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            margin: 10px 0;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            background: #f7fafc;
+            transition: all 0.3s ease;
+        }
+
+        .file-item.success {
+            border-color: #48bb78;
+            background: #f0fff4;
+        }
+
+        .file-item.error {
+            border-color: #f56565;
+            background: #fffaf0;
+        }
+
+        .file-info {
+            display: flex;
+            align-items: center;
+            flex: 1;
+        }
+
+        .file-icon {
+            font-size: 1.5rem;
+            margin-right: 12px;
+            color: #667eea;
+        }
+
+        .file-details h4 {
+            margin: 0;
+            color: #333;
+            font-size: 1rem;
+        }
+
+        .file-details p {
+            margin: 5px 0 0 0;
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .file-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
+            text-align: center;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5a67d8;
+            transform: translateY(-2px);
+        }
+
+        .btn-success {
+            background: #48bb78;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #38a169;
+        }
+
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #e53e3e;
+        }
+
+        .btn-secondary {
+            background: #e2e8f0;
+            color: #4a5568;
+        }
+
+        .btn-secondary:hover {
+            background: #cbd5e0;
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin: 30px 0;
+        }
+
+        .progress {
+            width: 100%;
+            height: 8px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            margin: 20px 0;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .status {
+            text-align: center;
+            margin: 20px 0;
+            padding: 15px;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+
+        .status.success {
+            background: #f0fff4;
+            color: #38a169;
+            border: 1px solid #9ae6b4;
+        }
+
+        .status.error {
+            background: #fffaf0;
+            color: #e53e3e;
+            border: 1px solid #feb2b2;
+        }
+
+        .status.info {
+            background: #ebf8ff;
+            color: #3182ce;
+            border: 1px solid #90cdf4;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge.success {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+
+        .badge.error {
+            background: #fed7d7;
+            color: #742a2a;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 20px;
+            }
+
+            h1 {
+                font-size: 2rem;
+            }
+
+            .controls {
+                flex-direction: column;
+            }
+
+            .file-item {
+                flex-direction: column;
+                gap: 15px;
+                text-align: center;
+            }
+
+            .file-actions {
+                justify-content: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📧 EML to PDF Converter</h1>
+        <p class="subtitle">Convert your Outlook .eml files to PDF format instantly</p>
+        
+        <div class="upload-area" id="upload-area">
+            <div class="upload-icon">📁</div>
+            <div class="upload-text">Drag & drop .eml files here</div>
+            <div class="upload-subtext">or click to select files</div>
+            <input type="file" id="file-input" multiple accept=".eml">
+        </div>
+
+        <div id="file-list" class="file-list hidden"></div>
+
+        <div style="display:flex; gap:10px; align-items:center; margin: 10px 0;">
+            <input type="password" id="password-input" placeholder="Enter access password" style="flex:1; padding:10px; border:1px solid #e2e8f0; border-radius:6px;">
+            <button id="unlock-btn" class="btn btn-primary" style="white-space:nowrap;">Unlock</button>
+            <span id="auth-status" class="badge" style="display:none"></span>
+        </div>
+
+        <div class="controls">
+            <button id="convert-btn" class="btn btn-primary" disabled>
+                <span id="convert-text">Convert to PDF</span>
+            </button>
+            <button id="clear-btn" class="btn btn-secondary hidden">Clear All</button>
+            <button id="download-all-btn" class="btn btn-success hidden">Download All PDFs</button>
+        </div>
+
+        <div id="progress" class="progress hidden">
+            <div id="progress-bar" class="progress-bar"></div>
+        </div>
+
+        <div id="status" class="status hidden"></div>
+    </div>
+
+    <script>
+    const API_URL = 'http://localhost:5002';
+        
+        let selectedFiles = [];
+        let isConverting = false;
+        let currentResults = [];
+        let currentSessionId = null;
+    let currentPassword = localStorage.getItem('appPassword') || '';
+    let isUnlocked = false;
+    let requiresPassword = false;
+
+        // DOM elements
+        const uploadArea = document.getElementById('upload-area');
+        const fileInput = document.getElementById('file-input');
+        const fileList = document.getElementById('file-list');
+        const convertBtn = document.getElementById('convert-btn');
+        const clearBtn = document.getElementById('clear-btn');
+        const downloadAllBtn = document.getElementById('download-all-btn');
+        const progress = document.getElementById('progress');
+        const progressBar = document.getElementById('progress-bar');
+        const status = document.getElementById('status');
+        const convertText = document.getElementById('convert-text');
+
+        // Event listeners
+        uploadArea.addEventListener('click', () => fileInput.click());
+        uploadArea.addEventListener('dragover', handleDragOver);
+        uploadArea.addEventListener('dragleave', handleDragLeave);
+        uploadArea.addEventListener('drop', handleDrop);
+        fileInput.addEventListener('change', handleFileSelect);
+        convertBtn.addEventListener('click', convertFiles);
+        clearBtn.addEventListener('click', clearFiles);
+        downloadAllBtn.addEventListener('click', downloadAllFiles);
+        document.getElementById('password-input').addEventListener('input', (e) => {
+            currentPassword = e.target.value;
+            localStorage.setItem('appPassword', currentPassword);
+            updateAuthStatus();
+        });
+        document.getElementById('password-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                updateAuthStatus();
+            }
+        });
+        document.getElementById('unlock-btn').addEventListener('click', (e) => {
+            e.preventDefault();
+            updateAuthStatus();
+        });
+
+        // Initialize password field and auth status
+        document.getElementById('password-input').value = currentPassword;
+        updateAuthStatus();
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        }
+
+        function handleDragLeave(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            
+            const files = Array.from(e.dataTransfer.files);
+            addFiles(files);
+        }
+
+        function handleFileSelect(e) {
+            const files = Array.from(e.target.files);
+            addFiles(files);
+        }
+
+        function addFiles(files) {
+            const emlFiles = files.filter(file => file.name.toLowerCase().endsWith('.eml'));
+            
+            if (emlFiles.length !== files.length) {
+                showStatus('Only .eml files are supported', 'error');
+                return;
+            }
+
+            selectedFiles.push(...emlFiles);
+            updateFileList();
+            updateButtons();
+        }
+
+        function updateFileList() {
+            if (selectedFiles.length === 0) {
+                fileList.classList.add('hidden');
+                return;
+            }
+
+            fileList.classList.remove('hidden');
+            fileList.innerHTML = selectedFiles.map((file, index) => `
+                <div class="file-item" id="file-${index}">
+                    <div class="file-info">
+                        <div class="file-icon">📧</div>
+                        <div class="file-details">
+                            <h4>${file.name}</h4>
+                            <p>${(file.size / 1024).toFixed(1)} KB</p>
+                        </div>
+                    </div>
+                    <div class="file-actions">
+                        <button class="btn btn-danger" onclick="removeFile(${index})" ${isConverting ? 'disabled' : ''}>
+                            Remove
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function removeFile(index) {
+            selectedFiles.splice(index, 1);
+            updateFileList();
+            updateButtons();
+        }
+
+        function updateButtons() {
+            // Disable convert if password is required and not unlocked
+            const gate = (requiresPassword && !isUnlocked);
+            convertBtn.disabled = selectedFiles.length === 0 || isConverting || gate;
+            
+            if (selectedFiles.length > 0) {
+                clearBtn.classList.remove('hidden');
+            } else {
+                clearBtn.classList.add('hidden');
+                downloadAllBtn.classList.add('hidden');
+            }
+        }
+
+        function downloadAllFiles() {
+            if (currentSessionId) {
+                const link = document.createElement('a');
+                const url = new URL(`${API_URL}/download-all/${currentSessionId}`);
+                if (currentPassword) url.searchParams.set('auth', currentPassword);
+                link.href = url.toString();
+                link.download = `converted_pdfs_${currentSessionId}.zip`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+        }
+
+        function clearFiles() {
+            selectedFiles = [];
+            currentResults = [];
+            currentSessionId = null;
+            fileInput.value = '';
+            updateFileList();
+            updateButtons();
+            hideStatus();
+        }
+
+        async function convertFiles() {
+            if (selectedFiles.length === 0) return;
+
+            isConverting = true;
+            updateButtons();
+            showProgress();
+            convertText.innerHTML = '<span class="loading"></span>Converting...';
+
+            try {
+                const formData = new FormData();
+                selectedFiles.forEach(file => {
+                    formData.append('files', file);
+                });
+
+                const response = await fetch(`${API_URL}/convert`, {
+                    method: 'POST',
+                    body: formData,
+                    headers: currentPassword ? { 'X-App-Password': currentPassword } : {}
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const result = await response.json();
+                currentResults = result.results;
+                currentSessionId = result.session_id;
+                updateResultsList(result.results);
+                
+                const successCount = result.results.filter(r => r.status === 'success').length;
+                showStatus(`Converted ${successCount} of ${result.results.length} files successfully`, 'success');
+
+                // Show download all button if at least one file was converted successfully
+                if (result.download_all_url && successCount >= 1) {
+                    downloadAllBtn.classList.remove('hidden');
+                }
+
+            } catch (error) {
+                console.error('Conversion error:', error);
+                showStatus(`Error: ${error.message}`, 'error');
+            } finally {
+                isConverting = false;
+                hideProgress();
+                convertText.textContent = 'Convert to PDF';
+                updateButtons();
+            }
+        }
+
+        function updateResultsList(results) {
+            results.forEach((result, index) => {
+                const fileItem = document.getElementById(`file-${index}`);
+                if (!fileItem) return;
+
+                fileItem.className = `file-item ${result.status}`;
+                
+                const actionsDiv = fileItem.querySelector('.file-actions');
+                
+                if (result.status === 'success') {
+                    actionsDiv.innerHTML = `
+                        <span class="badge success">✓ Success</span>
+                        <button class="btn btn-success" onclick="downloadFile('${result.session_id}', '${result.pdf_filename}', '${result.filename.replace('.eml', '.pdf')}')">
+                            Download PDF
+                        </button>
+                    `;
+                } else if (result.status === 'error') {
+                    actionsDiv.innerHTML = `
+                        <span class="badge error">✗ Error</span>
+                        <span style="color: #e53e3e; font-size: 0.9rem;">${result.message}</span>
+                    `;
+                }
+            });
+        }
+
+        function downloadFile(sessionId, pdfFilename, downloadName) {
+            const link = document.createElement('a');
+            const url = new URL(`${API_URL}/download/${sessionId}/${pdfFilename}`);
+            if (currentPassword) url.searchParams.set('auth', currentPassword);
+            link.href = url.toString();
+            link.download = downloadName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function showProgress() {
+            progress.classList.remove('hidden');
+            progressBar.style.width = '100%';
+        }
+
+        function hideProgress() {
+            progress.classList.add('hidden');
+            progressBar.style.width = '0%';
+        }
+
+        function showStatus(message, type) {
+            status.textContent = message;
+            status.className = `status ${type}`;
+            status.classList.remove('hidden');
+        }
+
+        function hideStatus() {
+            status.classList.add('hidden');
+        }
+
+        async function updateAuthStatus() {
+            const badge = document.getElementById('auth-status');
+            try {
+                const res = await fetch(`${API_URL}/auth/check`, {
+                    method: 'POST',
+                    headers: currentPassword ? { 'X-App-Password': currentPassword } : {}
+                });
+                if (res.ok) {
+                    // Try to parse body for more detail
+                    let data = null;
+                    try { data = await res.json(); } catch (_) {}
+                    // If backend says auth not required, mark accordingly
+                    requiresPassword = !(data && data.auth === 'not-required');
+                    isUnlocked = true; // either not required or accepted
+                    badge.textContent = 'Unlocked';
+                    badge.className = 'badge success';
+                    badge.style.display = 'inline-block';
+                    hideStatus();
+                } else {
+                    requiresPassword = true;
+                    isUnlocked = false;
+                    badge.textContent = 'Locked';
+                    badge.className = 'badge error';
+                    badge.style.display = 'inline-block';
+                    showStatus('Locked: Incorrect or missing password. Please enter your password and click Unlock.', 'error');
+                }
+            } catch (e) {
+                // If backend unreachable, don't gate by auth here
+                // Keep prior requiresPassword state; just hide badge
+                isUnlocked = false;
+                badge.style.display = 'none';
+            } finally {
+                updateButtons();
+            }
+        }
+
+    // Initialize
+    updateButtons();
+    // Probe backend to determine if password is required and current state
+    updateAuthStatus();
+    </script>
+</body>
+</html>

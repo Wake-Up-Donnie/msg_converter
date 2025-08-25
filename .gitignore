@@ -1,0 +1,105 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtualenvs
+venv/
+ENV/
+env/
+
+# Byte-compiled / cache
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# AWS / local creds / secrets
+.env
+.env.local
+.aws/
+aws_credentials
+aws_secret*
+
+# Editor and OS
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+.DS_Store
+Thumbs.db
+
+# Logs and runtime files
+*.log
+*.pid
+*.sock
+tmp/
+temp/
+*.tmp
+
+# Node / frontend
+frontend/node_modules/
+frontend/build/
+simple-frontend/node_modules/
+simple-frontend/build/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+.pnp.js
+
+# Build artifacts from frontend
+frontend/dist/
+frontend/.parcel-cache/
+
+# Playwright and browser caches / large runtime caches
+.playwright/
+tmp/.playwright/
+playwright-*
+/tmp/playwright-*
+/tmp/*playwright*
+
+# Converted files and generated output
+converted_files/
+converted_files/**
+
+# Twemoji cache (present in repo)
+converted_files/twemoji_cache/
+backend/twemoji_cache/
+tmp/twemoji_cache/
+tmp/twemoji_cache/**
+
+# PDFs / attachments (if you don't want them in repo)
+*.pdf
+*.zip
+*.tar
+*.gz
+
+# Large binary formats often tracked by mistake
+*.exe
+*.dll
+*.so
+*.dmg
+*.pkg
+
+# Git LFS pointers (if you use LFS to track some patterns)
+*.psd
+*.zip
+*.tgz
+*.mp4
+*.mov
+
+# Ignore local test output
+test-output/
