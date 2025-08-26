@@ -10,6 +10,8 @@ import email
 from email.policy import default
 from email.message import EmailMessage
 from email.generator import BytesGenerator
+from email.utils import parseaddr, parsedate_to_datetime
+from datetime import datetime, timezone
 import io
 import html
 import re
@@ -1555,24 +1557,225 @@ def fallback_html_to_pdf(html_content: str, output_path: str) -> bool:
 # Filename helper
 # =====================
 
+"""Enhanced filename derivation utilities.
+
+Adds logic to derive filenames in the format:
+  Lastname, F - MM-DD-YYYY.pdf
+based on the email's From + Date headers (with fallbacks), while preserving
+original behavior if extraction fails.
+"""
+
+# Signature block heuristic pattern (simple closers followed by a name line)
+NAME_SIG_PATTERN = re.compile(
+    r'(?:\n|\r\n)(?:Regards|Best|Thanks|Thank you|Sincerely|Cheers)[,\s]*\n+([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,3})\b'
+)
+
+def _split_display_name(display: str) -> tuple[str | None, str | None]:
+    """Parse display name returning (last_name, first_initial).
+    Supports formats:
+      - First Last
+      - First M. Last
+      - Last, First
+    """
+    if not display:
+        return None, None
+    display = re.sub(r'\s+', ' ', display).strip().strip('"')
+    if not display:
+        return None, None
+
+    # Handle "Last, First (Middle ...)" form
+    if ',' in display:
+        parts = [p.strip() for p in display.split(',') if p.strip()]
+        if len(parts) >= 2:
+            last_part = parts[0]
+            first_part = parts[1]
+            first_token = first_part.split()[0] if first_part else ''
+            last_token = last_part.split()[-1] if last_part else ''
+            if last_token and first_token:
+                return last_token.title(), first_token[:1].upper()
+
+    tokens = display.split()
+    if len(tokens) >= 2:
+        first = tokens[0]
+        last = tokens[-1]
+        return last.title(), first[:1].upper()
+
+    # Single token fallback
+    tok = tokens[0]
+    return tok.title(), tok[:1].upper()
+
+def _name_from_local_part(local: str) -> tuple[str | None, str | None]:
+    """Infer (last, first_initial) from email local-part such as 'john.q.public'."""
+    if not local:
+        return None, None
+    parts = [p for p in re.split(r'[._\-+]+', local) if p]
+    if len(parts) >= 2:
+        first = parts[0].title()
+        last = parts[-1].title()
+        return last, first[:1]
+    token = parts[0].title()
+    return token, token[:1]
+
+def extract_sender_name_and_date(eml_bytes: bytes) -> tuple[str | None, str | None, str | None]:
+    """Return (last_name, first_initial, date_str_MM_DD_YYYY) or (None,...).
+
+    Priority order for name:
+      1. Signature block (end-of-email)
+      2. Display name in From header
+      3. Local-part of address
+    Date fallback: current UTC date if header missing/unparseable.
+    """
+    try:
+        msg = email.message_from_bytes(eml_bytes, policy=default)
+    except Exception as e:
+        logger.warning(f"Failed to parse EML for naming: {e}")
+        return None, None, None
+
+    # Date extraction
+    date_hdr = msg.get('Date')
+    dt = None
+    if date_hdr:
+        try:
+            dt = parsedate_to_datetime(date_hdr)
+        except Exception:
+            dt = None
+    if not dt:
+        dt = datetime.now(timezone.utc)
+    try:
+        date_str = f"{dt.month:02d}-{dt.day:02d}-{dt.year:04d}"
+    except Exception:
+        date_str = None
+
+    from_hdr = msg.get('From', '') or ''
+    display, addr = parseaddr(from_hdr)
+    last = first_initial = None
+
+    # 1. Display name
+    if display:
+        l1, f1 = _split_display_name(display)
+        if l1 and f1:
+            last, first_initial = l1, f1
+
+    # 2. Local-part
+    if (not last or not first_initial) and addr:
+        local_part = addr.split('@')[0]
+        l2, f2 = _name_from_local_part(local_part)
+        if l2 and f2:
+            if not last:
+                last = l2
+            if not first_initial:
+                first_initial = f2
+
+    # 3. Signature heuristic (scan raw bytes) - original pattern using closers
+    raw_text = None
+    if (not last or not first_initial):
+        try:
+            raw_text = eml_bytes.decode('utf-8', errors='replace')
+            m = NAME_SIG_PATTERN.search(raw_text)
+            if m:
+                sig_name = m.group(1)
+                l3, f3 = _split_display_name(sig_name)
+                if l3 and f3:
+                    if not last:
+                        last = l3
+                    if not first_initial:
+                        first_initial = f3
+        except Exception:
+            pass
+
+    # 4. Advanced signature scanning override (prioritizes visible signature; handles forwarded emails & ligatures like 'Jeﬀ').
+    try:
+        if raw_text is None:
+            raw_text = eml_bytes.decode('utf-8', errors='replace')
+        import unicodedata
+        norm_text = unicodedata.normalize('NFKC', raw_text)
+        lines_original = norm_text.splitlines()
+        # Consider last 120 lines to widen signature search window
+        scan_lines = lines_original[-120:] if len(lines_original) > 120 else lines_original
+
+        # Common role/title indicators to boost confidence
+        ROLE_KEYWORDS = { 'chair', 'director', 'manager', 'president', 'ceo', 'cfo', 'coo', 'cto', 'counsel', 'attorney', 'esq', 'esquire', 'partner', 'engineer', 'analyst', 'sponsor', 'group', 'board', 'secretary', 'treasurer' }
+        ORG_WORDS = { 'group', 'county', 'inc', 'llc', 'corp', 'corporation', 'company', 'committee', 'department', 'office', 'university', 'college', 'school', 'agency', 'association' }
+        NAME_LINE_RE = re.compile(r"^\s*([A-Z][A-Za-z\u00C0-\u017F\uFB00-\uFB06'-]+)\s+([A-Z][A-Za-z\u00C0-\u017F\uFB00-\uFB06'-]{1,})\s*(?:,?\s*(Jr|Sr|II|III|IV))?\s*$")
+
+        candidates_ranked = []  # list of (score, line_index, first, last)
+        for idx, raw_line in enumerate(scan_lines):
+            line = raw_line.strip()
+            if not line or len(line) > 80:
+                continue
+            if '@' in line or ':' in line:
+                continue  # skip header/address lines
+            m2 = NAME_LINE_RE.match(line)
+            if not m2:
+                continue
+            first_tok, last_tok = m2.group(1), m2.group(2)
+            # Filter out obvious organization second tokens
+            if last_tok.lower() in ORG_WORDS:
+                continue
+            # Exclude lines where both tokens very long (likely phrase) or all caps
+            if (first_tok.isupper() and len(first_tok) > 4) and (last_tok.isupper() and len(last_tok) > 4):
+                continue
+            # Score: base 1
+            score = 1
+            # If following line is a role/title, boost score
+            next_line = scan_lines[idx+1].strip() if idx+1 < len(scan_lines) else ''
+            next_low = next_line.lower()
+            if next_low:
+                # Single or two-word title or contains a role keyword
+                words = next_low.split()
+                if any(w.strip(',.:;') in ROLE_KEYWORDS for w in words[:3]):
+                    score += 5
+                elif len(words) <= 4 and any(w.strip(',.:;') in ROLE_KEYWORDS for w in words):
+                    score += 3
+            # If there is a blank line after the name (common signature separation)
+            after_next = scan_lines[idx+2].strip() if idx+2 < len(scan_lines) else ''
+            if not next_line and after_next:
+                score += 1
+            # If line is near very bottom, small boost
+            if idx >= len(scan_lines) - 15:
+                score += 2
+            # If we already have a header-derived name and this differs in last name, extra boost to encourage override
+            if last and last_tok.lower() != (last or '').lower():
+                score += 2
+            candidates_ranked.append((score, idx, first_tok, last_tok))
+
+        if candidates_ranked:
+            # Pick highest scoring; if tie, choose the one appearing later (larger idx)
+            best = max(candidates_ranked, key=lambda t: (t[0], t[1]))
+            _, _, first_tok, last_tok = best
+            # Override unconditionally to reflect visible signer
+            last = last_tok
+            first_initial = first_tok[:1]
+            try:
+                logger.debug(f"Filename signature override: picked '{first_tok} {last_tok}' (score tuple={best})")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Normalize: keep alnum / dash / apostrophe / space for last
+    def _norm(x):
+        return re.sub(r"[^A-Za-z0-9\-']+", ' ', x).strip() if x else x
+    last = _norm(last)
+    first_initial = (first_initial or '')[:1]
+
+    if not last or not first_initial:
+        return None, None, date_str
+    return last, first_initial, date_str
+
 def sanitize_filename(name: str, default: str = 'file') -> str:
-    """Return a safe base filename without extension."""
+    """Return a safe base filename without extension.
+
+    Allows comma to support pattern: Lastname, F - MM-DD-YYYY
+    """
     if not name:
         return default
-
-    # Remove path components and get basename
     name = os.path.basename(name)
-
-    # Remove extension
     name_without_ext = os.path.splitext(name)[0]
-
-    # Keep only safe characters
-    import re
-    safe_name = re.sub(r'[^\w\s\.\-\(\)]', '', name_without_ext)
-
-    # Replace multiple spaces with single space and strip
-    safe_name = ' '.join(safe_name.split())
-
+    # Allow word chars, whitespace, dot, dash, parentheses, comma
+    safe_name = re.sub(r'[^\w\s\.\-\(\),]', '', name_without_ext)
+    safe_name = re.sub(r'\s{2,}', ' ', safe_name).strip()
+    safe_name = safe_name.rstrip('. ')
     return safe_name if safe_name else default
 
 # =====================
@@ -1700,7 +1903,29 @@ def handle_convert(event: Dict[str, Any]) -> Dict[str, Any]:
         else:
             session_id = str(uuid.uuid4())
             logger.info(f"Generated new session_id: {session_id}")
-        safe_base = sanitize_filename(filename, default='email')
+        # Enhanced filename derivation: Lastname, F - MM-DD-YYYY
+        enhanced_base = None
+        try:
+            last, fi, date_str = extract_sender_name_and_date(eml_source)
+            if last and fi and date_str:
+                candidate = f"{last}, {fi} - {date_str}"
+                cand_sanitized = sanitize_filename(candidate, default=None)
+                if cand_sanitized:
+                    enhanced_base = cand_sanitized
+                    logger.info(f"Enhanced filename derived: {enhanced_base}")
+                else:
+                    logger.info("Candidate filename sanitized to empty; ignoring enhanced name.")
+            else:
+                logger.info("Insufficient data for enhanced filename (need last, first initial, date).")
+        except Exception as e_fn:
+            logger.warning(f"Enhanced filename derivation failed: {e_fn}")
+
+        if enhanced_base:
+            safe_base = enhanced_base
+        else:
+            safe_base = sanitize_filename(filename, default='email')
+            if safe_base == 'email':
+                safe_base = f"email-{uuid.uuid4().hex[:8]}"
         pdf_filename = f"{safe_base}.pdf"
         logger.info(f"Generated session_id: {session_id}, pdf_filename: {pdf_filename}")
 
@@ -2173,6 +2398,24 @@ def handle_convert_s3(event: Dict[str, Any]) -> Dict[str, Any]:
                             "pdf_filename": None
                         })
                         continue
+
+                    # Enhanced filename derivation for batch
+                    enhanced_base = None
+                    try:
+                        last, fi, date_str = extract_sender_name_and_date(eml_source)
+                        if last and fi and date_str:
+                            candidate = f"{last}, {fi} - {date_str}"
+                            cand_sanitized = sanitize_filename(candidate, default=None)
+                            if cand_sanitized:
+                                enhanced_base = cand_sanitized
+                                logger.info(f"[convert-s3] Enhanced filename derived for {original_name}: {enhanced_base}")
+                    except Exception as e_fn:
+                        logger.warning(f"[convert-s3] Enhanced filename derivation failed for {original_name}: {e_fn}")
+                    if enhanced_base:
+                        base_no_ext = enhanced_base
+                    else:
+                        if base_no_ext == 'email':
+                            base_no_ext = f"email-{uuid.uuid4().hex[:8]}"
 
                     # Upload PDF to S3
                     pdf_filename = f"{base_no_ext}.pdf"
