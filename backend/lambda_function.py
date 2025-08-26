@@ -1107,6 +1107,27 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     body = body.replace('\n', '<br>')
             body = normalize_whitespace(body)
         logger.info(f"Body extracted. Length={len(body)}")
+        # Prepare optional inline attachment note (avoid automated-looking header pages in final PDF)
+        try:
+            _pdf_att_meta = [
+                a for a in (attachments or [])
+                if a.get('content_type') == 'application/pdf' or str(a.get('filename','')).lower().endswith('.pdf')
+            ]
+        except Exception:
+            _pdf_att_meta = []
+        attachment_inline_note = ""
+        if _pdf_att_meta and str(os.environ.get('ATTACHMENT_INLINE_NOTE','')).lower() in ("1","true","yes","on"):
+            try:
+                names = ", ".join(html.escape(a.get('filename') or f'attachment-{i+1}.pdf') for i,a in enumerate(_pdf_att_meta))
+                plural = 's' if len(_pdf_att_meta) != 1 else ''
+                attachment_inline_note = f"""
+                <div style=\"margin-top:24px; padding:10px 12px; background:#fafafa; border-left:3px solid #d0d0d0; font-size:11pt; color:#555;\">
+                    Attached PDF{plural}: {names}
+                </div>
+                """
+            except Exception as _e:
+                logger.warning(f"Failed building attachment inline note: {_e}")
+                attachment_inline_note = ""
 
         # Create HTML content (emoji-capable fonts and image styling)
         logger.info("Creating HTML content for PDF generation...")
@@ -1193,7 +1214,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 <div class="header-item"><span class="label">Date:</span> {html.escape(date)}</div>
             </div>
             <div class="email-body wrap">
-                {body}
+                {body}{attachment_inline_note}
             </div>
         </body>
         </html>
@@ -1234,72 +1255,37 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 logger.info("No PDF attachments found; body PDF copied to output")
                 return True
 
-            # Merge body + attachment PDFs (with a header page per attachment)
+            # Merge body + attachment PDFs (WITHOUT automated attachment cover pages)
             writer = PdfWriter()
             try:
                 body_reader = PdfReader(body_pdf_path)
+                body_pages = len(body_reader.pages)
                 for page in body_reader.pages:
                     writer.add_page(page)
+                logger.info(f"Body PDF pages appended: {body_pages}")
             except Exception as e:
                 logger.error(f"Failed reading body PDF: {e}")
-                # Fallback: just copy body
                 shutil.copyfile(body_pdf_path, output_path)
                 return True
 
             for idx, att in enumerate(pdf_attachments, start=1):
                 fname = att.get('filename') or f'attachment-{idx}.pdf'
-                # Create a simple header page
-                header_html = f"""
-                <!doctype html>
-                <html><head><meta charset='utf-8'><style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 2in 1in; }}
-                h1 {{ font-size: 24pt; margin: 0 0 10pt 0; }}
-                p {{ font-size: 12pt; color: #555; }}
-                .box {{ border: 2px solid #333; padding: 24pt; }}
-                </style></head>
-                <body><div class='box'>
-                <h1>Attachment</h1>
-                <p>File: {html.escape(fname)}</p>
-                </div></body></html>
-                """
-                header_pdf_path = None
                 try:
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_header:
-                        header_pdf_path = tmp_header.name
-                    # Try Playwright for header page, fallback to FPDF
-                    try:
-                        ok_header = html_to_pdf_playwright(header_html, header_pdf_path, twemoji_base_url)
-                    except Exception:
-                        ok_header = False
-                    if not ok_header:
-                        logger.warning("Header page render with Playwright failed; using FPDF fallback")
-                        ok_header = fallback_html_to_pdf(header_html, header_pdf_path)
-                    if ok_header and os.path.exists(header_pdf_path) and os.path.getsize(header_pdf_path) > 0:
-                        header_reader = PdfReader(header_pdf_path)
-                        for page in header_reader.pages:
-                            writer.add_page(page)
-                except Exception as e:
-                    logger.warning(f"Failed to create header page for {fname}: {e}")
-                finally:
-                    if header_pdf_path:
-                        try:
-                            os.unlink(header_pdf_path)
-                        except Exception:
-                            pass
-
-                # Append attachment pages
-                try:
-                    att_reader = PdfReader(io.BytesIO(att.get('data') or b''))
+                    raw = att.get('data') or b''
+                    if not raw:
+                        logger.warning(f"Skipping empty PDF attachment '{fname}'")
+                        continue
+                    att_reader = PdfReader(io.BytesIO(raw))
+                    apages = len(att_reader.pages)
                     for page in att_reader.pages:
                         writer.add_page(page)
+                    logger.info(f"Appended attachment '{fname}' ({apages} page{'s' if apages != 1 else ''})")
                 except Exception as e:
-                    logger.warning(f"Skipping unreadable PDF attachment {fname}: {e}")
+                    logger.warning(f"Skipping unreadable PDF attachment '{fname}': {e}")
 
-            # Write combined PDF
             with open(output_path, 'wb') as out_f:
                 writer.write(out_f)
-
-            logger.info("Combined PDF (body + attachments) written successfully")
+            logger.info("Combined PDF (body + attachments) written successfully (no attachment title pages)")
             return True
         finally:
             if body_pdf_path:
