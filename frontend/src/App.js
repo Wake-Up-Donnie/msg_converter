@@ -101,109 +101,133 @@ function App() {
   const [results, setResults] = useState([]);
   const [progress, setProgress] = useState(0);
   const [sessionId, setSessionId] = useState(null);
-  const [password, setPassword] = useState('');
-  const [authOk, setAuthOk] = useState(false);
-  const [requiresAuth, setRequiresAuth] = useState(false);
+  // Password/auth states
+  // passwordInput: what user is typing
+  // validatedPassword: last successfully validated full password
+  const [passwordInput, setPasswordInput] = useState('');
+  const [validatedPassword, setValidatedPassword] = useState('');
+  const [authOk, setAuthOk] = useState(false); // true immediately after successful validation (paired with validatedPassword)
+  const [requiresAuth, setRequiresAuth] = useState(false); // true when backend requires a password
+  const [authError, setAuthError] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
 
+  // Attempt silent validation of stored password on mount (without setting error states)
   useEffect(() => {
     const saved = window.localStorage.getItem('appPassword') || '';
     if (saved) {
-      setPassword(saved);
+      setPasswordInput(saved);
+      (async () => {
+        const ok = await attemptAuth(saved, true);
+        if (ok) {
+          setValidatedPassword(saved);
+          setAuthOk(true);
+          setRequiresAuth(true); // backend requires password
+        } else {
+          // clear bad stored password
+          window.localStorage.removeItem('appPassword');
+        }
+      })();
+    } else {
+      // Probe whether auth is required without a password
+      (async () => {
+        const needAuth = await detectAuthRequirement();
+        setRequiresAuth(needAuth);
+        if (!needAuth) setAuthOk(true);
+      })();
     }
   }, []);
 
-  // Super simplified auth check function - using the exact same approach that worked with curl
-  // Modified to accept an optional direct password parameter
-  const checkAuth = useCallback(async (directPassword = null) => {
-    // Use either directly provided password or state password
-    const passwordToUse = directPassword !== null ? directPassword : password;
-    
+  // Detect if backend requires auth (no password supplied). Returns boolean.
+  const detectAuthRequirement = useCallback(async () => {
     try {
-      console.log('🔑 Checking authentication with password value:', passwordToUse);
-      console.log('🔐 Password length:', passwordToUse ? passwordToUse.length : 0);
-      console.log('📊 API_BASE_URL is:', API_BASE_URL);
-      
-      if (isCloudFrontUrl) {
-        console.log('🌐 Using CloudFront-specific auth strategy');
-        
-        // Ensure we have a password before trying to authenticate
-        if (!passwordToUse) {
-          console.error('⚠️ No password provided for authentication!');
-          setRequiresAuth(true);
-          setAuthOk(false);
-          return;
-        }
-        
-        // Get the direct URL with auth parameter (this worked with curl)
-  const hardcodedUrl = `${API_BASE_URL}/api/health?auth=${encodeURIComponent(passwordToUse)}`;
-  console.log('🔗 Using health URL:', hardcodedUrl);
-  console.log('🔑 AUTH PARAM VALUE:', encodeURIComponent(passwordToUse));
-        
-        try {
-          // Make a simple GET request with exact same approach that worked with curl
-          const response = await axios.get(hardcodedUrl);
-          
-          console.log('✅ Authentication succeeded! Response:', response.status, response.data);
-          setRequiresAuth(true);
-          setAuthOk(true);
-          
-          // Save successful password to localStorage if it was direct input
-          if (directPassword !== null) {
-            window.localStorage.setItem('appPassword', directPassword);
-            setPassword(directPassword);
-          }
-        } catch (error) {
-          console.error('❌ Authentication error with API call:', error.message);
-          if (error.response) {
-            console.error('Response details:', error.response.status, error.response.data);
-          }
-          setRequiresAuth(true);
-          setAuthOk(false);
-        }
-      } else {
-        // Local development: use auth/check with headers
-        console.log('🖥️ Using local development auth strategy');
-        const headers = passwordToUse ? { 
-          'X-App-Password': passwordToUse, 
-          'Authorization': `Bearer ${passwordToUse}` 
-        } : {};
-        
-        try {
-          const res = await axios.post(`${API_BASE_URL}/auth/check`, {}, { headers });
-          
-          // Handle auth not required response
-          const data = res?.data || {};
-          console.log('📝 Auth check response:', data);
-          
-          if (data && data.auth === 'not-required') {
-            setRequiresAuth(false);
-            setAuthOk(true);
-          } else {
-            setRequiresAuth(true);
-            setAuthOk(true);
-          }
-        } catch (error) {
-          console.error('❌ Local auth check failed:', error.message);
-          setRequiresAuth(true);
-          setAuthOk(false);
-        }
+      // Use auth/check without password; backend returns auth:not-required when open.
+      const url = isCloudFrontUrl ? `${API_BASE_URL}/api/auth/check` : `${API_BASE_URL}/auth/check`;
+      // Backend lambda implementation expects GET; Flask version uses POST. We'll try GET then fallback.
+      try {
+        const res = await axios.get(url, { validateStatus: () => true });
+        if (res.status === 200 && res.data?.auth === 'not-required') return false;
+        if (res.status === 200 && res.data?.ok) return true; // password required but not provided -> ambiguous, treat as required
+        if (res.status === 401) return true;
+      } catch {
+        // Fallback to POST (Flask local dev)
+        const res2 = await axios.post(url.replace('/api', ''), {}, { validateStatus: () => true });
+        if (res2.status === 200 && res2.data?.auth === 'not-required') return false;
+        if (res2.status === 200 && res2.data?.ok) return true;
+        if (res2.status === 401) return true;
       }
     } catch (e) {
-      console.error('❌ Overall auth check failed:', e);
+      console.warn('Auth requirement probe failed:', e);
+    }
+    return true; // default to requiring auth for safety
+  }, []);
+
+  // Core auth attempt using provided password. silent=true suppresses user-facing error messages.
+  const attemptAuth = useCallback(async (pwd, silent = false) => {
+    setAuthError('');
+    if (!pwd) {
+      if (!silent) setAuthError('Password required');
+      setAuthOk(false);
+      return false;
+    }
+    setAuthLoading(true);
+    try {
+      const url = isCloudFrontUrl ? `${API_BASE_URL}/api/auth/check` : `${API_BASE_URL}/auth/check`;
+      const headers = { 'X-App-Password': pwd, 'Authorization': `Bearer ${pwd}` };
+      // Try GET first (Lambda path), fallback to POST (Flask local dev)
+      let res = await axios.get(url, { headers, validateStatus: () => true }).catch(() => null);
+      if (!res) {
+        res = await axios.post(url.replace('/api', ''), {}, { headers, validateStatus: () => true }).catch(() => null);
+      }
+      if (res && res.status === 200 && (res.data?.ok === true)) {
+        if (!silent) console.log('Auth success');
+        return true;
+      }
+      if (!silent) setAuthError('Invalid password');
+      return false;
+    } catch (e) {
+      if (!silent) setAuthError('Network/auth error');
+      return false;
+    } finally {
+      setAuthLoading(false);
+    }
+  }, []);
+
+  const handleUnlock = useCallback(async () => {
+    const candidate = passwordInput.trim();
+    if (!candidate) {
+      setAuthError('Enter a password');
+      return;
+    }
+    const ok = await attemptAuth(candidate, false);
+    if (ok) {
+      setValidatedPassword(candidate);
+      setAuthOk(true);
       setRequiresAuth(true);
+      window.localStorage.setItem('appPassword', candidate);
+    } else {
+      setValidatedPassword('');
       setAuthOk(false);
     }
-  }, [password]);
+  }, [attemptAuth, passwordInput]);
 
-  // Check on initial load
-  useEffect(() => {
-    checkAuth();
-  }, [checkAuth]);
+  const handleClearPassword = useCallback(() => {
+    setPasswordInput('');
+    setValidatedPassword('');
+    setAuthOk(false);
+    setAuthError('');
+    window.localStorage.removeItem('appPassword');
+  }, []);
 
-  // Re-check when password changes
+  // If user edits the password after unlocking, immediately relock (remove validated password)
   useEffect(() => {
-    checkAuth();
-  }, [password, checkAuth]);
+    if (validatedPassword && passwordInput !== validatedPassword) {
+      setAuthOk(false);
+      setValidatedPassword(''); // prevent stale password usage
+    }
+  }, [passwordInput, validatedPassword]);
+
+  // Derived effective auth: must both have authOk and a validatedPassword matching current input
+  const effectiveAuth = authOk && validatedPassword && passwordInput === validatedPassword;
 
   const onDrop = useCallback((acceptedFiles, rejectedFiles) => {
     // Allow .eml and .msg files
@@ -236,7 +260,7 @@ function App() {
 
   const convertFiles = async () => {
     if (files.length === 0) return;
-    if (requiresAuth && !authOk) {
+    if (requiresAuth && !effectiveAuth) {
       alert('Please unlock with the password before converting.');
       return;
     }
@@ -253,7 +277,7 @@ function App() {
     try {
       // 1) Upload ALL files directly to S3 using pre-signed PUT URLs
       setProgress(10);
-      const keys = await uploadFilesViaS3(files, password);
+  const keys = await uploadFilesViaS3(files, validatedPassword);
       // Basic progress bump after uploads complete
       setProgress(70);
 
@@ -261,12 +285,12 @@ function App() {
       let s3Url = `${API_BASE_URL}/convert-s3`;
       let s3Headers = {};
       if (isCloudFrontUrl) {
-        s3Url = `${API_BASE_URL}/api/convert-s3${password ? `?auth=${encodeURIComponent(password)}` : ''}`;
-        if (password) {
-          s3Headers = { 'X-App-Password': password, 'Authorization': `Bearer ${password}` };
+        s3Url = `${API_BASE_URL}/api/convert-s3${validatedPassword ? `?auth=${encodeURIComponent(validatedPassword)}` : ''}`;
+        if (validatedPassword) {
+          s3Headers = { 'X-App-Password': validatedPassword, 'Authorization': `Bearer ${validatedPassword}` };
         }
-      } else if (password) {
-        s3Headers = { 'X-App-Password': password, 'Authorization': `Bearer ${password}` };
+      } else if (validatedPassword) {
+        s3Headers = { 'X-App-Password': validatedPassword, 'Authorization': `Bearer ${validatedPassword}` };
       }
 
       const conv = await axios.post(s3Url, { keys, session_id: batchSessionId }, { headers: s3Headers });
@@ -350,7 +374,7 @@ function App() {
       : `${API_BASE_URL}/download/${sessionId}/${encodedName}`;
     
     const url = new URL(urlPath);
-    if (password) url.searchParams.set('auth', password);
+  if (validatedPassword && effectiveAuth) url.searchParams.set('auth', validatedPassword);
     link.href = url.toString();
     const suggestedName = (pdfFilename || originalFilename).replace(/\.(eml|msg)$/i, '') + '.pdf';
     link.download = suggestedName;
@@ -368,7 +392,7 @@ function App() {
         : `${API_BASE_URL}/download-all/${sessionId}`;
       
       const url = new URL(urlPath);
-      if (password) url.searchParams.set('auth', password);
+  if (validatedPassword && effectiveAuth) url.searchParams.set('auth', validatedPassword);
       link.href = url.toString();
       link.download = `converted_pdfs_${sessionId}.zip`;
       document.body.appendChild(link);
@@ -421,48 +445,44 @@ function App() {
         <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 3 }}>
           <input
             type="password"
-            placeholder="Enter access password"
-            value={password}
+            placeholder={requiresAuth ? 'Enter access password' : 'Password not required'}
+            value={passwordInput}
             onChange={(e) => {
-              setPassword(e.target.value);
-              // Removed localStorage update here - will happen on successful auth
+              setPasswordInput(e.target.value);
+              setAuthError('');
             }}
             style={{ flex: 1, padding: '10px', borderRadius: 6, border: '1px solid #ccc' }}
-            // Add onKeyPress to support Enter key
-            onKeyPress={(e) => {
+            onKeyDown={(e) => {
               if (e.key === 'Enter') {
-                console.log('Enter key pressed with password value:', e.target.value);
-                checkAuth(e.target.value);
+                handleUnlock();
               }
             }}
+            disabled={authLoading}
           />
           <Button
             variant="contained"
-            onClick={() => {
-              // EXTREME DEBUGGING: For testing on AWS, let's use a hardcoded password
-              // to rule out any issues with React state or DOM access
-              const hardcodedPassword = "mysecretpassword";
-              console.log('Unlock button clicked with HARDCODED password:', hardcodedPassword);
-              console.log('HARDCODED Password length:', hardcodedPassword.length);
-              // Use the hardcoded password value
-              checkAuth(hardcodedPassword);
-            }}
+            onClick={handleUnlock}
+            disabled={authLoading || effectiveAuth || !passwordInput}
           >
-            Unlock
+            {authLoading ? 'Checking...' : (effectiveAuth ? 'Unlocked' : 'Unlock')}
           </Button>
           <Button
             variant="outlined"
-            onClick={() => window.localStorage.removeItem('appPassword')}
+            onClick={handleClearPassword}
+            disabled={authLoading}
           >
             Clear
           </Button>
-          {!authOk && (
-            <Chip label="Locked" color="warning" size="small" />
+          {!effectiveAuth && (
+            <Chip label={validatedPassword ? 'Modified - Relock' : 'Locked'} color="warning" size="small" />
           )}
-          {authOk && (
-            <Chip label="Unlocked" color="success" size="small" />
-          )}
+          {effectiveAuth && <Chip label="Unlocked" color="success" size="small" />}
         </Box>
+        {authError && (
+          <Box sx={{ mb: 2 }}>
+            <Alert severity="error" onClose={() => setAuthError('')}>{authError}</Alert>
+          </Box>
+        )}
 
         {/* File Drop Zone */}
         <Box
@@ -524,7 +544,7 @@ function App() {
             variant="contained"
             size="large"
             onClick={convertFiles}
-            disabled={files.length === 0 || converting || (requiresAuth && !authOk)}
+            disabled={files.length === 0 || converting || (requiresAuth && !effectiveAuth)}
             startIcon={<PictureAsPdf />}
           >
             {converting ? 'Converting...' : 'Convert to PDF'}
