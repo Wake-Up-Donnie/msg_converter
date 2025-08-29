@@ -54,7 +54,9 @@ case "$ENVIRONMENT" in
       echo "ERROR: Refusing to deploy prod without CONFIRM_PROD=YES"
       exit 1
     fi
-    STACK_NAME="eml-converter"
+    # Use the same naming pattern as dev to ensure updates target the original prod stack
+    # (previous resources/log groups/buckets were created under eml-converter-prod)
+    STACK_NAME="eml-converter-prod"
     ECR_REPO="eml-converter"
     EFFECTIVE_PASSWORD="${PASSWORD:-${PROD_APP_PASSWORD:-}}"
     if [[ -z "${EFFECTIVE_PASSWORD}" ]]; then

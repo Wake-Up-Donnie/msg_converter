@@ -1,7 +1,8 @@
-playwright==1.54.0  # Updated to match official Docker image
+tzlocal
+playwright==1.54.0  # Needed for HTML->PDF (Chromium installed separately later)
 flask==2.3.3
 flask-cors==4.0.0
-boto3==1.34.0
+# boto3 removed: use version bundled in Lambda base image to avoid uninstall/reinstall disk usage
 python-multipart==0.0.6
 Pillow==10.1.0
 email-reply-parser==0.5.12
@@ -11,7 +12,6 @@ fpdf==1.7.2  # Added for fallback PDF generation when Playwright is not availabl
 psutil==5.9.6  # For memory monitoring and process management
 extract-msg
 olefile
-tzlocal
 # For AWS Lambda PDF generation - provided by the layer at runtime
 # pyppeteer-core>=1.0.0
 # chrome-aws-lambda>=8.0.2

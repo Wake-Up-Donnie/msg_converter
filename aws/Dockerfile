@@ -13,8 +13,7 @@ RUN pip3 install --upgrade pip
 
 # ---- Python deps ----
 COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip3 install -r /tmp/requirements.txt \
-    && pip3 install playwright==1.54.0
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 
 # ---- System deps for headless Chromium on Amazon Linux 2023 ----
 # Space optimization notes:
