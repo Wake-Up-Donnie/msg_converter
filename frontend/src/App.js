@@ -104,76 +104,95 @@ function App() {
   const [password, setPassword] = useState('');
   const [authOk, setAuthOk] = useState(false);
   const [requiresAuth, setRequiresAuth] = useState(false);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(false);
 
   useEffect(() => {
     const saved = window.localStorage.getItem('appPassword') || '';
     if (saved) {
       setPassword(saved);
+      // Only auto-check auth if we have a saved password
+      checkAuth(saved);
+    } else {
+      // Check if auth is required but don't auto-authenticate
+      checkAuthRequirement();
     }
   }, []);
 
-  // Super simplified auth check function - using the exact same approach that worked with curl
-  // Modified to accept an optional direct password parameter
-  const checkAuth = useCallback(async (directPassword = null) => {
-    // Use either directly provided password or state password
-    const passwordToUse = directPassword !== null ? directPassword : password;
-    
+  // Check if authentication is required without attempting to authenticate
+  const checkAuthRequirement = useCallback(async () => {
     try {
-      console.log('🔑 Checking authentication with password value:', passwordToUse);
-      console.log('🔐 Password length:', passwordToUse ? passwordToUse.length : 0);
-      console.log('📊 API_BASE_URL is:', API_BASE_URL);
-      
+      console.log('🔍 Checking if auth is required...');
       if (isCloudFrontUrl) {
-        console.log('🌐 Using CloudFront-specific auth strategy');
-        
-        // Ensure we have a password before trying to authenticate
-        if (!passwordToUse) {
-          console.error('⚠️ No password provided for authentication!');
-          setRequiresAuth(true);
-          setAuthOk(false);
-          return;
-        }
-        
-        // Get the direct URL with auth parameter (this worked with curl)
-  const hardcodedUrl = `${API_BASE_URL}/api/health?auth=${encodeURIComponent(passwordToUse)}`;
-  console.log('🔗 Using health URL:', hardcodedUrl);
-  console.log('🔑 AUTH PARAM VALUE:', encodeURIComponent(passwordToUse));
-        
+        // For CloudFront, we assume auth is always required
+        setRequiresAuth(true);
+        setAuthOk(false);
+      } else {
+        // For local development, check auth/check endpoint without credentials
         try {
-          // Make a simple GET request with exact same approach that worked with curl
-          const response = await axios.get(hardcodedUrl);
-          
-          console.log('✅ Authentication succeeded! Response:', response.status, response.data);
-          setRequiresAuth(true);
-          setAuthOk(true);
-          
-          // Save successful password to localStorage if it was direct input
-          if (directPassword !== null) {
-            window.localStorage.setItem('appPassword', directPassword);
-            setPassword(directPassword);
+          const res = await axios.post(`${API_BASE_URL}/auth/check`, {}, {});
+          const data = res?.data || {};
+          if (data && data.auth === 'not-required') {
+            setRequiresAuth(false);
+            setAuthOk(true);
+          } else {
+            setRequiresAuth(true);
+            setAuthOk(false);
           }
         } catch (error) {
-          console.error('❌ Authentication error with API call:', error.message);
-          if (error.response) {
-            console.error('Response details:', error.response.status, error.response.data);
-          }
           setRequiresAuth(true);
           setAuthOk(false);
+        }
+      }
+    } catch (e) {
+      console.error('❌ Error checking auth requirement:', e);
+      setRequiresAuth(true);
+      setAuthOk(false);
+    }
+  }, []);
+
+  // Authenticate with specific password - only called explicitly
+  const checkAuth = useCallback(async (passwordToAuthenticate) => {
+    if (!passwordToAuthenticate) {
+      console.error('⚠️ No password provided for authentication!');
+      setAuthOk(false);
+      return false;
+    }
+
+    setIsCheckingAuth(true);
+    
+    try {
+      console.log('🔑 Attempting authentication...');
+      console.log('🔐 Password length:', passwordToAuthenticate.length);
+      
+      if (isCloudFrontUrl) {
+        console.log('🌐 Using CloudFront authentication');
+        
+        const authUrl = `${API_BASE_URL}/api/health?auth=${encodeURIComponent(passwordToAuthenticate)}`;
+        
+        try {
+          const response = await axios.get(authUrl);
+          console.log('✅ Authentication successful!');
+          setRequiresAuth(true);
+          setAuthOk(true);
+          window.localStorage.setItem('appPassword', passwordToAuthenticate);
+          setPassword(passwordToAuthenticate);
+          return true;
+        } catch (error) {
+          console.error('❌ Authentication failed:', error.response?.status, error.response?.data);
+          setAuthOk(false);
+          return false;
         }
       } else {
         // Local development: use auth/check with headers
-        console.log('🖥️ Using local development auth strategy');
-        const headers = passwordToUse ? { 
-          'X-App-Password': passwordToUse, 
-          'Authorization': `Bearer ${passwordToUse}` 
-        } : {};
+        console.log('🖥️ Using local development authentication');
+        const headers = { 
+          'X-App-Password': passwordToAuthenticate, 
+          'Authorization': `Bearer ${passwordToAuthenticate}` 
+        };
         
         try {
           const res = await axios.post(`${API_BASE_URL}/auth/check`, {}, { headers });
-          
-          // Handle auth not required response
           const data = res?.data || {};
-          console.log('📝 Auth check response:', data);
           
           if (data && data.auth === 'not-required') {
             setRequiresAuth(false);
@@ -182,27 +201,35 @@ function App() {
             setRequiresAuth(true);
             setAuthOk(true);
           }
+          window.localStorage.setItem('appPassword', passwordToAuthenticate);
+          setPassword(passwordToAuthenticate);
+          return true;
         } catch (error) {
-          console.error('❌ Local auth check failed:', error.message);
-          setRequiresAuth(true);
+          console.error('❌ Local auth failed:', error.message);
           setAuthOk(false);
+          return false;
         }
       }
     } catch (e) {
-      console.error('❌ Overall auth check failed:', e);
-      setRequiresAuth(true);
+      console.error('❌ Authentication error:', e);
       setAuthOk(false);
+      return false;
+    } finally {
+      setIsCheckingAuth(false);
     }
-  }, [password]);
+  }, []);
 
-  // Check on initial load
-  useEffect(() => {
-    checkAuth();
-  }, [checkAuth]);
-
-  // Re-check when password changes
-  useEffect(() => {
-    checkAuth();
+  // Handle unlock button click
+  const handleUnlock = useCallback(async () => {
+    if (!password.trim()) {
+      alert('Please enter a password');
+      return;
+    }
+    
+    const success = await checkAuth(password.trim());
+    if (!success) {
+      alert('Authentication failed. Please check your password.');
+    }
   }, [password, checkAuth]);
 
   const onDrop = useCallback((acceptedFiles, rejectedFiles) => {
@@ -431,24 +458,16 @@ function App() {
             // Add onKeyPress to support Enter key
             onKeyPress={(e) => {
               if (e.key === 'Enter') {
-                console.log('Enter key pressed with password value:', e.target.value);
-                checkAuth(e.target.value);
+                handleUnlock();
               }
             }}
           />
           <Button
             variant="contained"
-            onClick={() => {
-              // EXTREME DEBUGGING: For testing on AWS, let's use a hardcoded password
-              // to rule out any issues with React state or DOM access
-              const hardcodedPassword = "mysecretpassword";
-              console.log('Unlock button clicked with HARDCODED password:', hardcodedPassword);
-              console.log('HARDCODED Password length:', hardcodedPassword.length);
-              // Use the hardcoded password value
-              checkAuth(hardcodedPassword);
-            }}
+            onClick={handleUnlock}
+            disabled={isCheckingAuth}
           >
-            Unlock
+            {isCheckingAuth ? 'Checking...' : 'Unlock'}
           </Button>
           <Button
             variant="outlined"

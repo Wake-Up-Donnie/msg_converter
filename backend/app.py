@@ -759,7 +759,7 @@ class EMLToPDFConverter:
                     p {{ font-size: 12pt; color: #555; }}
                     .box {{ border: 2px solid #333; padding: 24pt; }}
                     </style></head>
-                    <body><div class='box'>
+                    <body><div class='box
                     <h1>Attachment</h1>
                     <p>File: {html.escape(fname)}</p>
                     </div></body></html>
@@ -832,6 +832,7 @@ def require_password():
         return jsonify({'error': 'Unauthorized'}), 401
 
 @app.route('/auth/check', methods=['POST'])
+@app.route('/api/auth/check', methods=['POST'])
 def auth_check():
     """Optional endpoint for clients to validate password"""
     if not APP_PASSWORD:
@@ -842,6 +843,7 @@ def auth_check():
     return jsonify({'ok': False}), 401
 
 @app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'service': 'eml-to-pdf-converter'})
@@ -978,6 +980,7 @@ def convert_files():
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/download/<session_id>/<filename>', methods=['GET'])
+@app.route('/api/download/<session_id>/<filename>', methods=['GET'])
 def download_file(session_id, filename):
     """Download converted PDF file"""
     try:
