@@ -747,39 +747,9 @@ class EMLToPDFConverter:
                         pass
                     return subject
 
-                # Append each attachment preceded by a header page
+                # Append each attachment PDF directly (no header/cover page)
                 for idx, att in enumerate(pdf_attachments, start=1):
                     fname = att.get('filename') or f'attachment-{idx}.pdf'
-                    # Create a simple header page for the attachment
-                    header_html = f"""
-                    <!doctype html>
-                    <html><head><meta charset='utf-8'><style>
-                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 2in 1in; }}
-                    h1 {{ font-size: 24pt; margin: 0 0 10pt 0; }}
-                    p {{ font-size: 12pt; color: #555; }}
-                    .box {{ border: 2px solid #333; padding: 24pt; }}
-                    </style></head>
-                    <body><div class='box
-                    <h1>Attachment</h1>
-                    <p>File: {html.escape(fname)}</p>
-                    </div></body></html>
-                    """
-                    header_fd, header_pdf_path = tempfile.mkstemp(suffix='.pdf')
-                    os.close(header_fd)
-                    try:
-                        self.html_to_pdf(header_html, header_pdf_path)
-                        header_reader = PdfReader(header_pdf_path)
-                        for page in header_reader.pages:
-                            writer.add_page(page)
-                    except Exception as e:
-                        logger.warning(f"Failed to create header page for {fname}: {e}")
-                    finally:
-                        try:
-                            os.remove(header_pdf_path)
-                        except Exception:
-                            pass
-
-                    # Append the attachment PDF pages
                     try:
                         att_reader = PdfReader(io.BytesIO(att['data']))
                         for page in att_reader.pages:

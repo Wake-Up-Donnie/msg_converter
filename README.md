@@ -1,6 +1,15 @@
 ## 🎉 **Updated for EML Files!**
 
 The applicat### Fastest way (simple frontend, no Node required)
+
+
+deploy on dev
+bash aws/deploy-container.sh --env dev --password ""
+
+deploy on prod
+
+bash aws/deploy-container.sh --env prod --password ""
+
 ```bash
 # From repo root
 python3 -m venv .venv
