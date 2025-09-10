@@ -903,12 +903,21 @@ def replace_image_references(html_content: str, images: Dict[str, str]) -> str:
         logger.warning(f"Error replacing image references: {str(e)}")
         return html_content
 
-def convert_doc_to_pdf_bytes(doc_bytes: bytes, filename: str | None = None) -> bytes | None:
+def convert_doc_to_pdf_bytes(
+    doc_bytes: bytes,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> bytes | None:
     """Convert DOC/DOCX bytes to PDF bytes using LibreOffice."""
     tmp_in_path = None
     out_dir = None
     try:
-        ext = os.path.splitext(filename or "")[1] or ".doc"
+        ext = os.path.splitext(filename or "")[1]
+        if not ext:
+            if content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                ext = ".docx"
+            else:
+                ext = ".doc"
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_in:
             tmp_in.write(doc_bytes)
             tmp_in_path = tmp_in.name
@@ -1051,9 +1060,18 @@ def extract_body_and_images_from_email(msg):
                     if not data:
                         return
                     if is_doc:
-                        pdf_bytes = convert_doc_to_pdf_bytes(data, fname)
+                        pdf_bytes = convert_doc_to_pdf_bytes(data, fname, ctype)
                         if pdf_bytes:
-                            att_name = fname or f"attachment-{len(attachments)+1}.doc"
+                            if fname:
+                                att_name = fname
+                            else:
+                                default_ext = (
+                                    ".docx"
+                                    if ctype
+                                    == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                    else ".doc"
+                                )
+                                att_name = f"attachment-{len(attachments)+1}{default_ext}"
                             base, _ = os.path.splitext(att_name)
                             att_name = f"{base}.pdf"
                             attachments.append({
