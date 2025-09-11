@@ -86,7 +86,9 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
     Uses LibreOffice if available. If that fails (e.g. binary missing), fall back
     to ``pypandoc`` if available, then to ``mammoth`` for ``.docx`` or a
     best-effort text extraction for ``.doc`` via the ``antiword`` command. The
-    resulting HTML/text is rendered to PDF using :func:`html_to_pdf`.
+    resulting HTML/text is rendered to PDF using
+    :func:`html_to_pdf_playwright` with a fallback to
+    :func:`fallback_html_to_pdf`.
     """
     src_path = None
     out_dir = None
@@ -174,7 +176,11 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
                 tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix='.pdf')
                 os.close(tmp_pdf_fd)
                 try:
-                    html_to_pdf_playwright(html_content, tmp_pdf_path)
+                    try:
+                        html_to_pdf_playwright(html_content, tmp_pdf_path)
+                    except Exception as he:
+                        logger.warning(f"Playwright render failed: {he}; using fallback renderer")
+                        fallback_html_to_pdf(html_content, tmp_pdf_path)
                     with open(tmp_pdf_path, 'rb') as f:
                         return f.read()
                 finally:
