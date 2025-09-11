@@ -21,13 +21,6 @@ import shutil
 import urllib.request
 import urllib.error
 import subprocess
-import logging
-import html
-import re
-import zipfile
-import shutil
-import urllib.request
-import urllib.error
 
 
 app = Flask(__name__)
@@ -137,8 +130,9 @@ class EMLToPDFConverter:
         """Convert .doc/.docx bytes to PDF bytes.
 
         First tries to use LibreOffice (if installed). If that fails, fall back to
-        pure-Python approaches for .docx (via ``mammoth``) and .doc (via
-        the ``antiword`` command) and render the resulting HTML/text to PDF using the existing
+        pure-Python approaches: ``pypandoc`` (if available) for both ``.doc`` and
+        ``.docx``, ``mammoth`` for ``.docx`` and finally the ``antiword`` command
+        for ``.doc``. The resulting HTML/text is rendered to PDF using the existing
         ``html_to_pdf`` helper.
         """
         src_path = None
@@ -167,17 +161,42 @@ class EMLToPDFConverter:
                 return f.read()
         except Exception as e:
             logger.warning(f"DOC/DOCX conversion failed: {e}")
-            # Fallback for environments without LibreOffice
+            # Fallbacks for environments without LibreOffice
             try:
                 html_content = None
                 lower_ext = ext.lower()
-                if lower_ext == '.docx':
+
+                # Try pypandoc first as it can handle both .doc and .docx
+                try:
+                    import pypandoc  # type: ignore
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                        tmp.write(data)
+                        tmp.flush()
+                        tmp_path = tmp.name
+                    try:
+                        try:
+                            html_content = pypandoc.convert_file(tmp_path, 'html')
+                        except OSError:
+                            pypandoc.download_pandoc()
+                            html_content = pypandoc.convert_file(tmp_path, 'html')
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                except Exception as pe:
+                    logger.warning(f"pypandoc conversion failed: {pe}")
+
+                # If pypandoc failed, fall back to mammoth for .docx
+                if not html_content and lower_ext == '.docx':
                     try:
                         import mammoth  # type: ignore
                         html_content = mammoth.convert_to_html(io.BytesIO(data)).value
                     except Exception as me:
                         logger.warning(f"mammoth conversion failed: {me}")
-                elif lower_ext == '.doc':
+
+                # Or antiword for .doc
+                if not html_content and lower_ext == '.doc':
                     try:
                         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                             tmp.write(data)
@@ -332,7 +351,6 @@ class EMLToPDFConverter:
             # Leave native emoji characters in the HTML; we'll convert them to
             # inline SVGs via Twemoji inside the browser before generating the PDF
             # for consistent cross-viewer rendering.
-            pass
 
             # Create HTML content
             html_content = f"""

@@ -13,6 +13,4 @@ extract-msg
 olefile
 tzlocal
 mammoth==1.6.0
-# For AWS Lambda PDF generation - provided by the layer at runtime
-# pyppeteer-core>=1.0.0
-# chrome-aws-lambda>=8.0.2
+pypandoc-binary==1.13
