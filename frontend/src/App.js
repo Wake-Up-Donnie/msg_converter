@@ -284,7 +284,7 @@ function App() {
       // Basic progress bump after uploads complete
       setProgress(70);
 
-      // 2) Request server-side conversion for all uploaded keys in one call
+      // 2) Request server-side conversion for each uploaded key individually
       let s3Url = `${API_BASE_URL}/convert-s3`;
       let s3Headers = {};
       if (isCloudFrontUrl) {
@@ -296,33 +296,51 @@ function App() {
         s3Headers = { 'X-App-Password': password, 'Authorization': `Bearer ${password}` };
       }
 
-      const conv = await axios.post(s3Url, { keys, session_id: batchSessionId }, { headers: s3Headers });
-
-      // 3) Map results to UI format
-      const resultsData = (conv.data && Array.isArray(conv.data.results)) ? conv.data.results : [];
-      const mapped = resultsData.map(r => {
-        if (r && r.status === 'success') {
-          return {
-            filename: r.filename || 'file',
-            status: 'success',
-            subject: 'No Subject',
-            session_id: r.session_id,
-            pdf_filename: r.pdf_filename,
-            message: 'Conversion successful (S3)'
-          };
+      const aggregated = [];
+      let finalSessionId = null;
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        try {
+          const conv = await axios.post(s3Url, { keys: [key], session_id: batchSessionId }, { headers: s3Headers });
+          const resultsData = (conv.data && Array.isArray(conv.data.results)) ? conv.data.results : [];
+          const r = resultsData[0];
+          if (r && r.status === 'success') {
+            aggregated.push({
+              filename: r.filename || 'file',
+              status: 'success',
+              subject: 'No Subject',
+              session_id: r.session_id,
+              pdf_filename: r.pdf_filename,
+              message: 'Conversion successful (S3)'
+            });
+            if (!finalSessionId && r.session_id) finalSessionId = r.session_id;
+          } else {
+            aggregated.push({
+              filename: (r && r.filename) || 'file',
+              status: 'error',
+              message: (r && r.message) || 'PDF conversion failed',
+              subject: null,
+              session_id: null,
+              pdf_filename: null
+            });
+          }
+        } catch (err) {
+          console.error('Conversion error:', err);
+          aggregated.push({
+            filename: key.split('/').pop() || 'file',
+            status: 'error',
+            message: err?.response?.data?.message || err.message || 'PDF conversion failed',
+            subject: null,
+            session_id: null,
+            pdf_filename: null
+          });
         }
-        return {
-          filename: (r && r.filename) || 'file',
-          status: 'error',
-          message: (r && r.message) || 'PDF conversion failed',
-          subject: null,
-          session_id: null,
-          pdf_filename: null
-        };
-      });
+        // Update progress incrementally after each conversion
+        setProgress(70 + Math.round(30 * ((i + 1) / keys.length)));
+      }
 
-      setResults(mapped);
-      setSessionId(conv.data?.session_id || batchSessionId);
+      setResults(aggregated);
+      setSessionId(finalSessionId || batchSessionId);
       setProgress(100);
     } catch (error) {
       console.error('Conversion error:', error);
