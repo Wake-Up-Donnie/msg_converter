@@ -1138,7 +1138,6 @@ def extract_body_and_images_from_email(msg):
                         except Exception:
                             pass
                         try:
-                            import os
                             base = os.path.basename(fname)
                             if base:
                                 keys.add(base)
