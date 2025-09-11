@@ -118,6 +118,26 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
         except Exception:
             pass
 
+def eml_bytes_to_pdf_bytes(eml_bytes: bytes) -> bytes | None:
+    """Convert EML bytes to PDF bytes using convert_eml_to_pdf helper."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
+            pdf_path = tmp_pdf.name
+        ok = convert_eml_to_pdf(eml_bytes, pdf_path)
+        if ok and os.path.exists(pdf_path):
+            with open(pdf_path, 'rb') as f:
+                return f.read()
+        return None
+    except Exception as e:
+        logger.warning(f"EML to PDF conversion failed: {e}")
+        return None
+    finally:
+        try:
+            if 'pdf_path' in locals() and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except Exception:
+            pass
+
 # =====================
 # Multipart parsing
 # =====================
@@ -968,8 +988,23 @@ def extract_body_and_images_from_email(msg):
             cloc = part.get('Content-Location')
             fname = part.get_filename()
 
-            if ctype == 'message/rfc822':
+            if ctype == 'message/rfc822' or (fname and fname.lower().endswith(('.eml', '.msg'))):
                 payload = part.get_payload(decode=True) or part.get_payload()
+                if 'attachment' in cdisp or fname:
+                    try:
+                        data = payload
+                        if not isinstance(data, (bytes, bytearray)) and hasattr(data, 'as_bytes'):
+                            data = data.as_bytes()
+                        if data and fname and fname.lower().endswith('.msg'):
+                            data = convert_msg_bytes_to_eml_bytes(data)
+                        if data:
+                            pdf_data = eml_bytes_to_pdf_bytes(data)
+                            if pdf_data:
+                                att_name = os.path.splitext(fname or f"attachment-{len(attachments)+1}")[0] + '.pdf'
+                                attachments.append({'filename': att_name, 'content_type': 'application/pdf', 'data': pdf_data})
+                    except Exception as e:
+                        logger.warning(f"Failed to process attached message: {e}")
+                    return
                 try:
                     if isinstance(payload, (bytes, bytearray)):
                         nested = email.message_from_bytes(payload, policy=email.policy.default)
