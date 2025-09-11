@@ -19,6 +19,7 @@ import zipfile
 import shutil
 import urllib.request
 import urllib.error
+import subprocess
 import logging
 import html
 import re
@@ -130,6 +131,46 @@ class EMLToPDFConverter:
             return 'Unknown Date'
         except Exception:
             return 'Unknown Date'
+
+    def convert_office_to_pdf(self, data: bytes, ext: str) -> bytes | None:
+        """Convert .doc/.docx bytes to PDF bytes using LibreOffice if available."""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as src:
+                src.write(data)
+                src.flush()
+            out_dir = tempfile.mkdtemp()
+            cmd = [
+                'libreoffice',
+                '--headless',
+                '--convert-to',
+                'pdf',
+                src.name,
+                '--outdir',
+                out_dir,
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            pdf_path = os.path.join(
+                out_dir, os.path.splitext(os.path.basename(src.name))[0] + '.pdf'
+            )
+            with open(pdf_path, 'rb') as f:
+                return f.read()
+        except Exception as e:
+            logger.warning(f"DOC/DOCX conversion failed: {e}")
+            return None
+        finally:
+            try:
+                os.remove(src.name)
+            except Exception:
+                pass
+            try:
+                if 'pdf_path' in locals() and os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(out_dir)
+            except Exception:
+                pass
     
     def extract_eml_content(self, eml_path):
         """Extract content from EML file including images"""
@@ -385,19 +426,37 @@ class EMLToPDFConverter:
                 # PDF or other attachments
                 is_attachment = 'attachment' in cdisp
                 is_inline_pdf = (ctype == 'application/pdf') or (fname and fname.lower().endswith('.pdf'))
-                if is_attachment or is_inline_pdf:
+                is_office = ctype in (
+                    'application/msword',
+                    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                ) or (fname and fname.lower().endswith(('.doc', '.docx')))
+                if is_attachment or is_inline_pdf or is_office:
                     try:
                         data = part.get_payload(decode=True)
-                        if data and (ctype == 'application/pdf' or (fname and fname.lower().endswith('.pdf'))):
-                            att_name = fname or f"attachment-{len(attachments)+1}.pdf"
-                            if not att_name.lower().endswith('.pdf'):
-                                att_name += '.pdf'
-                            attachments.append({
-                                'filename': att_name,
-                                'content_type': 'application/pdf',
-                                'data': data,
-                            })
-                            return
+                        if not data:
+                            data = part.get_payload()
+                        if data:
+                            if ctype == 'application/pdf' or (fname and fname.lower().endswith('.pdf')):
+                                att_name = fname or f"attachment-{len(attachments)+1}.pdf"
+                                if not att_name.lower().endswith('.pdf'):
+                                    att_name += '.pdf'
+                                attachments.append({
+                                    'filename': att_name,
+                                    'content_type': 'application/pdf',
+                                    'data': data,
+                                })
+                                return
+                            if is_office:
+                                ext = os.path.splitext(fname or '')[1] or '.docx'
+                                pdf_data = self.convert_office_to_pdf(data, ext)
+                                if pdf_data:
+                                    att_name = os.path.splitext(fname or f"attachment-{len(attachments)+1}")[0] + '.pdf'
+                                    attachments.append({
+                                        'filename': att_name,
+                                        'content_type': 'application/pdf',
+                                        'data': pdf_data,
+                                    })
+                                return
                         # Non-PDF attachments are ignored for merge purposes
                     except Exception as e:
                         logger.warning(f"Error extracting attachment: {e}")
