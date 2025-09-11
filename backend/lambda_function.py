@@ -20,6 +20,7 @@ from playwright.sync_api import sync_playwright
 from fpdf import FPDF
 from pypdf import PdfReader, PdfWriter
 import shutil
+import subprocess
 
 ############################################
 # Robust logging configuration
@@ -78,6 +79,44 @@ def _get_body_bytes(event: Dict[str, Any]) -> bytes:
     if isinstance(body, str):
         return body.encode("utf-8", errors="ignore")
     return body or b""
+
+def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
+    """Convert .doc/.docx bytes to PDF using LibreOffice if available."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as src:
+            src.write(data)
+            src.flush()
+        out_dir = tempfile.mkdtemp()
+        cmd = [
+            'libreoffice',
+            '--headless',
+            '--convert-to',
+            'pdf',
+            src.name,
+            '--outdir',
+            out_dir,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pdf_path = os.path.join(out_dir, os.path.splitext(os.path.basename(src.name))[0] + '.pdf')
+        with open(pdf_path, 'rb') as f:
+            return f.read()
+    except Exception as e:
+        logger.warning(f"DOC/DOCX conversion failed: {e}")
+        return None
+    finally:
+        try:
+            os.remove(src.name)
+        except Exception:
+            pass
+        try:
+            if 'pdf_path' in locals() and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(out_dir)
+        except Exception:
+            pass
 
 # =====================
 # Multipart parsing
@@ -1006,19 +1045,37 @@ def extract_body_and_images_from_email(msg):
             # PDF or other attachments
             is_attachment = 'attachment' in cdisp
             is_inline_pdf = (ctype == 'application/pdf') or (fname and fname.lower().endswith('.pdf'))
-            if is_attachment or is_inline_pdf:
+            is_office = ctype in (
+                'application/msword',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            ) or (fname and fname.lower().endswith(('.doc', '.docx')))
+            if is_attachment or is_inline_pdf or is_office:
                 try:
                     data = part.get_payload(decode=True)
-                    if data and (ctype == 'application/pdf' or (fname and fname.lower().endswith('.pdf'))):
-                        att_name = fname or f"attachment-{len(attachments)+1}.pdf"
-                        if not att_name.lower().endswith('.pdf'):
-                            att_name += '.pdf'
-                        attachments.append({
-                            'filename': att_name,
-                            'content_type': 'application/pdf',
-                            'data': data,
-                        })
-                        return
+                    if not data:
+                        data = part.get_payload()
+                    if data:
+                        if ctype == 'application/pdf' or (fname and fname.lower().endswith('.pdf')):
+                            att_name = fname or f"attachment-{len(attachments)+1}.pdf"
+                            if not att_name.lower().endswith('.pdf'):
+                                att_name += '.pdf'
+                            attachments.append({
+                                'filename': att_name,
+                                'content_type': 'application/pdf',
+                                'data': data,
+                            })
+                            return
+                        if is_office:
+                            ext = os.path.splitext(fname or '')[1] or '.docx'
+                            pdf_data = convert_office_to_pdf(data, ext)
+                            if pdf_data:
+                                att_name = os.path.splitext(fname or f"attachment-{len(attachments)+1}")[0] + '.pdf'
+                                attachments.append({
+                                    'filename': att_name,
+                                    'content_type': 'application/pdf',
+                                    'data': pdf_data,
+                                })
+                            return
                 except Exception as e:
                     logger.warning(f"Error extracting attachment: {e}")
                     return
