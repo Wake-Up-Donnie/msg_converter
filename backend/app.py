@@ -203,6 +203,7 @@ class EMLToPDFConverter:
                             tmp.flush()
                             tmp_path = tmp.name
                         try:
+                            # antiword outputs plain text; if unavailable this will fail
                             result = subprocess.run(
                                 ['antiword', tmp_path],
                                 check=True,
