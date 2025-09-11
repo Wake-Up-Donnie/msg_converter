@@ -84,9 +84,9 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
     """Convert .doc/.docx bytes to PDF bytes.
 
     Uses LibreOffice if available. If that fails (e.g. binary missing), fall back
-    to a pure-Python approach for ``.docx`` (``mammoth``) or a best-effort text
-    extraction for ``.doc`` via the ``antiword`` command. The resulting HTML/text
-    is rendered to PDF using :func:`html_to_pdf`.
+    to ``pypandoc`` if available, then to ``mammoth`` for ``.docx`` or a
+    best-effort text extraction for ``.doc`` via the ``antiword`` command. The
+    resulting HTML/text is rendered to PDF using :func:`html_to_pdf`.
     """
     src_path = None
     out_dir = None
@@ -115,19 +115,45 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
         try:
             html_content = None
             lower_ext = ext.lower()
-            if lower_ext == '.docx':
+
+            # Try pypandoc first for both .doc and .docx
+            try:
+                import pypandoc  # type: ignore
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                    tmp.write(data)
+                    tmp.flush()
+                    tmp_path = tmp.name
+                try:
+                    try:
+                        html_content = pypandoc.convert_file(tmp_path, 'html')
+                    except OSError:
+                        pypandoc.download_pandoc()
+                        html_content = pypandoc.convert_file(tmp_path, 'html')
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+            except Exception as pe:
+                logger.warning(f"pypandoc conversion failed: {pe}")
+
+            # Fallback to mammoth for .docx
+            if not html_content and lower_ext == '.docx':
                 try:
                     import mammoth  # type: ignore
                     html_content = mammoth.convert_to_html(io.BytesIO(data)).value
                 except Exception as me:
                     logger.warning(f"mammoth conversion failed: {me}")
-            elif lower_ext == '.doc':
+
+            # Or antiword for .doc
+            if not html_content and lower_ext == '.doc':
                 try:
                     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                         tmp.write(data)
                         tmp.flush()
                         tmp_path = tmp.name
                     try:
+                        # antiword outputs plain text; if unavailable this will fail
                         result = subprocess.run(
                             ['antiword', tmp_path],
                             check=True,
@@ -148,7 +174,7 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
                 tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix='.pdf')
                 os.close(tmp_pdf_fd)
                 try:
-                    html_to_pdf(html_content, tmp_pdf_path)
+                    html_to_pdf_playwright(html_content, tmp_pdf_path)
                     with open(tmp_pdf_path, 'rb') as f:
                         return f.read()
                 finally:
