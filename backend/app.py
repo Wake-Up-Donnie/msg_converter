@@ -26,6 +26,7 @@ import zipfile
 import shutil
 import urllib.request
 import urllib.error
+import subprocess
 
 
 app = Flask(__name__)
@@ -85,6 +86,56 @@ def unique_filename(directory: str, filename: str) -> str:
         candidate = f"{base} ({i}){ext}"
         i += 1
     return candidate
+
+def convert_doc_to_pdf_bytes(
+    doc_bytes: bytes,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> bytes | None:
+    """Convert DOC/DOCX bytes to PDF bytes using LibreOffice."""
+    tmp_in_path = None
+    out_dir = None
+    try:
+        ext = os.path.splitext(filename or "")[1]
+        if not ext:
+            if content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                ext = ".docx"
+            else:
+                ext = ".doc"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_in:
+            tmp_in.write(doc_bytes)
+            tmp_in_path = tmp_in.name
+        out_dir = tempfile.mkdtemp()
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            out_dir,
+            tmp_in_path,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out_pdf = os.path.join(
+            out_dir, os.path.splitext(os.path.basename(tmp_in_path))[0] + ".pdf"
+        )
+        if os.path.exists(out_pdf):
+            with open(out_pdf, "rb") as f:
+                return f.read()
+    except Exception as e:
+        logger.warning(f"DOC to PDF conversion failed: {e}")
+    finally:
+        if tmp_in_path:
+            try:
+                os.unlink(tmp_in_path)
+            except Exception:
+                pass
+        if out_dir:
+            try:
+                shutil.rmtree(out_dir)
+            except Exception:
+                pass
+    return None
 
 class EMLToPDFConverter:
     def __init__(self):
@@ -382,13 +433,43 @@ class EMLToPDFConverter:
                         images.setdefault(f"__unref__:{len(images)}", data_url)
                     return
 
-                # PDF or other attachments
+                # PDF or DOC attachments
                 is_attachment = 'attachment' in cdisp
                 is_inline_pdf = (ctype == 'application/pdf') or (fname and fname.lower().endswith('.pdf'))
-                if is_attachment or is_inline_pdf:
+                is_doc = (
+                    ctype in (
+                        'application/msword',
+                        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    )
+                    or (fname and fname.lower().endswith(('.doc', '.docx')))
+                )
+                if is_attachment or is_inline_pdf or is_doc:
                     try:
                         data = part.get_payload(decode=True)
-                        if data and (ctype == 'application/pdf' or (fname and fname.lower().endswith('.pdf'))):
+                        if not data:
+                            return
+                        if is_doc:
+                            pdf_bytes = convert_doc_to_pdf_bytes(data, fname, ctype)
+                            if pdf_bytes:
+                                if fname:
+                                    att_name = fname
+                                else:
+                                    default_ext = (
+                                        ".docx"
+                                        if ctype
+                                        == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                        else ".doc"
+                                    )
+                                    att_name = f"attachment-{len(attachments)+1}{default_ext}"
+                                base, _ = os.path.splitext(att_name)
+                                att_name = f"{base}.pdf"
+                                attachments.append({
+                                    'filename': att_name,
+                                    'content_type': 'application/pdf',
+                                    'data': pdf_bytes,
+                                })
+                                return
+                        if ctype == 'application/pdf' or (fname and fname.lower().endswith('.pdf')):
                             att_name = fname or f"attachment-{len(attachments)+1}.pdf"
                             if not att_name.lower().endswith('.pdf'):
                                 att_name += '.pdf'
