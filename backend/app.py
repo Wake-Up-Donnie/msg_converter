@@ -92,6 +92,45 @@ class EMLToPDFConverter:
         if os.environ.get('AWS_EXECUTION_ENV'):  # Running in Lambda
             self.s3_client = boto3.client('s3')
     
+    def get_display_date(self, msg) -> str:
+        """Return a human-readable date from the message with fallbacks.
+        Prefer the Date header as provided; fall back to common alternates or
+        the trailing timestamp of the first Received header. Never empty.
+        """
+        try:
+            def dec(v):
+                return self.safe_decode_header(v) if v is not None else ''
+
+            # Primary Date header
+            d = dec(msg.get('Date'))
+            if d:
+                return d
+
+            # Alternate headers sometimes used by clients/gateways
+            for h in (
+                'Sent', 'X-Original-Date', 'Original-Date', 'Resent-Date', 'Delivery-date',
+                'X-Received-Date', 'X-Delivery-Date', 'X-Apple-Original-Arrival-Date',
+            ):
+                d = dec(msg.get(h))
+                if d:
+                    return d
+
+            # Fallback: parse the date portion from the first Received header
+            try:
+                recvd = msg.get_all('Received') or []
+                if recvd:
+                    first = dec(recvd[0])
+                    if ';' in first:
+                        tail = first.rsplit(';', 1)[-1].strip()
+                        if tail:
+                            return tail
+            except Exception:
+                pass
+
+            return 'Unknown Date'
+        except Exception:
+            return 'Unknown Date'
+    
     def extract_eml_content(self, eml_path):
         """Extract content from EML file including images"""
         try:
@@ -116,11 +155,11 @@ class EMLToPDFConverter:
             if not msg:
                 raise Exception("Could not parse email message")
             
-            # Extract basic headers with safe decoding
+            # Extract basic headers with safe decoding and robust date fallback
             subject = self.safe_decode_header(msg.get('Subject', 'No Subject'))
             sender = self.safe_decode_header(msg.get('From', 'Unknown Sender'))
             recipient = self.safe_decode_header(msg.get('To', 'Unknown Recipient'))
-            date = msg.get('Date', 'Unknown Date')
+            date_display = self.get_display_date(msg)
             
             # Extract body content and images
             try:
@@ -194,7 +233,7 @@ class EMLToPDFConverter:
                     <div class="email-meta">
                         <strong>From:</strong> {html.escape(sender)}<br>
                         <strong>To:</strong> {html.escape(recipient)}<br>
-                        <strong>Date:</strong> {html.escape(date)}
+                        <strong>Date:</strong> {html.escape(date_display)}
                     </div>
                 </div>
                 <div class="content">

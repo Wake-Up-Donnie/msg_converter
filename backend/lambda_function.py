@@ -8,9 +8,10 @@ import logging
 from typing import Dict, Any
 import email
 from email.policy import default
+from email.header import decode_header
 from email.message import EmailMessage
 from email.generator import BytesGenerator
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime, format_datetime
 from datetime import datetime, timezone
 import io
 import html
@@ -287,6 +288,17 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
 
         try:
             m = extract_msg.Message(tmp_path)
+            # Attempt to obtain a displayable Date value up front
+            date_hdr = None
+            try:
+                date_val = getattr(m, 'date', None)
+                if isinstance(date_val, datetime):
+                    date_hdr = format_datetime(date_val)
+                elif date_val:
+                    date_hdr = str(date_val)
+            except Exception:
+                date_hdr = None
+
             # Prefer native conversion if available
             em = None
             if hasattr(m, 'as_email'):
@@ -314,13 +326,8 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
                 if bcc_list:
                     em['Bcc'] = ', '.join(bcc_list if isinstance(bcc_list, list) else [str(bcc_list)])
 
-                # Date if available
-                try:
-                    date_str = getattr(m, 'date', None)
-                    if date_str:
-                        em['Date'] = str(date_str)
-                except Exception:
-                    pass
+                if date_hdr:
+                    em['Date'] = date_hdr
 
                 # Body: prefer HTML
                 def _decode_to_str(val):
@@ -339,14 +346,14 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
                         return str(val)
                     except Exception:
                         return ''
-                
+
                 html_body = _decode_to_str(getattr(m, 'htmlBody', None) or getattr(m, 'html', None))
                 text_body = _decode_to_str(getattr(m, 'body', None) or '')
-                
+
                 # Normalize line endings in plain text to avoid CR artifacts
                 if text_body:
                     text_body = text_body.replace('\r\n', '\n').replace('\r', '\n')
-                
+
                 if html_body:
                     # Set plain part too if available
                     if text_body:
@@ -431,6 +438,10 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
                             continue
                 except Exception:
                     pass
+            else:
+                # Ensure Date header exists when using as_email()
+                if date_hdr and not em.get('Date'):
+                    em['Date'] = date_hdr
 
             # Harmonize/ensure inline image attachments present even when using as_email()
             try:
@@ -1062,6 +1073,69 @@ def extract_body_and_images_from_email(msg):
     logger.info(f"Parsed email: body_len={len(body) if body else 0}, images_inlined={sum(1 for k in images.keys() if not str(k).startswith('__unref__:'))}")
     return body, images, attachments
 
+def _safe_decode_header(value) -> str:
+    """Decode RFC 2047/2231 encoded header values to a readable string."""
+    try:
+        if value is None:
+            return "Unknown"
+        # Coerce header objects to string first
+        if not isinstance(value, (str, bytes)):
+            value = str(value)
+        parts = decode_header(value)
+        out = []
+        for chunk, enc in parts:
+            if isinstance(chunk, bytes):
+                try:
+                    out.append(chunk.decode(enc or 'utf-8', errors='replace'))
+                except Exception:
+                    out.append(chunk.decode('utf-8', errors='replace'))
+            else:
+                out.append(chunk)
+        return ''.join(out).strip()
+    except Exception:
+        try:
+            return str(value)
+        except Exception:
+            return "Unknown"
+
+
+def _extract_display_date(msg) -> str:
+    """Return a human-readable date for the message with sensible fallbacks.
+    Prefers the Date header as-is; falls back to common alternative headers or the trailing
+    timestamp from the first Received header. Never returns an empty string.
+    """
+    # Prefer standard Date header
+    primary = msg.get('Date')
+    dstr = _safe_decode_header(primary) if primary else ''
+    if dstr:
+        return dstr
+
+    # Common alternates seen in various clients/gateways
+    alt_headers = [
+        'Sent', 'X-Original-Date', 'Original-Date', 'Resent-Date', 'Delivery-date',
+        'X-Received-Date', 'X-Delivery-Date', 'X-Apple-Original-Arrival-Date',
+    ]
+    for h in alt_headers:
+        v = msg.get(h)
+        dstr = _safe_decode_header(v) if v else ''
+        if dstr:
+            return dstr
+
+    # Parse from the topmost Received header (date appears after the last semicolon)
+    try:
+        recvd = msg.get_all('Received') or []
+        if recvd:
+            first = _safe_decode_header(recvd[0]) or ''
+            if ';' in first:
+                tail = first.rsplit(';', 1)[-1].strip()
+                if tail:
+                    return tail
+    except Exception:
+        pass
+
+    return 'Unknown Date'
+
+
 def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: str = None) -> bool:
     """Convert EML content to PDF using Playwright with fallback to FPDF."""
     logger.info("=== CONVERT_EML_TO_PDF STARTED ===")
@@ -1072,12 +1146,12 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         msg = email.message_from_bytes(eml_content, policy=default)
         logger.info("EML message parsed successfully")
 
-        # Extract basic email information
-        subject = msg.get('Subject', 'No Subject')
-        sender = msg.get('From', 'Unknown Sender')
-        recipient = msg.get('To', 'Unknown Recipient')
-        date = msg.get('Date', 'Unknown Date')
-        logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date}'")
+        # Extract basic email information (decode safely)
+        subject = _safe_decode_header(msg.get('Subject', 'No Subject'))
+        sender = _safe_decode_header(msg.get('From', 'Unknown Sender'))
+        recipient = _safe_decode_header(msg.get('To', 'Unknown Recipient'))
+        date_display = _extract_display_date(msg)
+        logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}'")
 
         # Rich extraction: body + inline images
         logger.info("Extracting email body + inline images...")
@@ -1213,7 +1287,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 <div class="header-item"><span class="label">From:</span> {html.escape(sender)}</div>
                 <div class="header-item"><span class="label">To:</span> {html.escape(recipient)}</div>
                 <div class="header-item"><span class="label">Subject:</span> {html.escape(subject)}</div>
-                <div class="header-item"><span class="label">Date:</span> {html.escape(date)}</div>
+                <div class="header-item"><span class="label">Date:</span> {html.escape(date_display)}</div>
             </div>
             <div class="email-body wrap">
                 {body}{attachment_inline_note}
