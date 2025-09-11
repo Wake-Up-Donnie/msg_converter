@@ -11,7 +11,7 @@ from email.policy import default
 from email.header import decode_header
 from email.message import EmailMessage
 from email.generator import BytesGenerator
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime, format_datetime
 from datetime import datetime, timezone
 import io
 import html
@@ -288,6 +288,17 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
 
         try:
             m = extract_msg.Message(tmp_path)
+            # Attempt to obtain a displayable Date value up front
+            date_hdr = None
+            try:
+                date_val = getattr(m, 'date', None)
+                if isinstance(date_val, datetime):
+                    date_hdr = format_datetime(date_val)
+                elif date_val:
+                    date_hdr = str(date_val)
+            except Exception:
+                date_hdr = None
+
             # Prefer native conversion if available
             em = None
             if hasattr(m, 'as_email'):
@@ -315,13 +326,8 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
                 if bcc_list:
                     em['Bcc'] = ', '.join(bcc_list if isinstance(bcc_list, list) else [str(bcc_list)])
 
-                # Date if available
-                try:
-                    date_str = getattr(m, 'date', None)
-                    if date_str:
-                        em['Date'] = str(date_str)
-                except Exception:
-                    pass
+                if date_hdr:
+                    em['Date'] = date_hdr
 
                 # Body: prefer HTML
                 def _decode_to_str(val):
@@ -340,14 +346,14 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
                         return str(val)
                     except Exception:
                         return ''
-                
+
                 html_body = _decode_to_str(getattr(m, 'htmlBody', None) or getattr(m, 'html', None))
                 text_body = _decode_to_str(getattr(m, 'body', None) or '')
-                
+
                 # Normalize line endings in plain text to avoid CR artifacts
                 if text_body:
                     text_body = text_body.replace('\r\n', '\n').replace('\r', '\n')
-                
+
                 if html_body:
                     # Set plain part too if available
                     if text_body:
@@ -432,6 +438,10 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
                             continue
                 except Exception:
                     pass
+            else:
+                # Ensure Date header exists when using as_email()
+                if date_hdr and not em.get('Date'):
+                    em['Date'] = date_hdr
 
             # Harmonize/ensure inline image attachments present even when using as_email()
             try:
