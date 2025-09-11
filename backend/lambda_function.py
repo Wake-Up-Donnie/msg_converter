@@ -174,7 +174,7 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
                 tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix='.pdf')
                 os.close(tmp_pdf_fd)
                 try:
-                    html_to_pdf(html_content, tmp_pdf_path)
+                    html_to_pdf_playwright(html_content, tmp_pdf_path)
                     with open(tmp_pdf_path, 'rb') as f:
                         return f.read()
                 finally:
