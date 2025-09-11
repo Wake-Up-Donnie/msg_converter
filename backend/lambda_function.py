@@ -80,6 +80,276 @@ def _get_body_bytes(event: Dict[str, Any]) -> bytes:
         return body.encode("utf-8", errors="ignore")
     return body or b""
 
+def convert_doc_with_pypandoc_and_images(doc_data: bytes, ext: str) -> str:
+    """Convert .doc/.docx to HTML using pypandoc with enhanced image handling.
+    
+    Uses pypandoc to convert the document and attempts to extract images
+    from the document structure when possible.
+    """
+    try:
+        import pypandoc
+        import tempfile
+        import zipfile
+        import base64
+        import os
+        
+        # Track extracted images
+        extracted_images = []
+        
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(doc_data)
+            tmp.flush()
+            tmp_path = tmp.name
+            
+        try:
+            # For .docx files, try to extract images from the ZIP structure first
+            if ext.lower() == '.docx':
+                try:
+                    with zipfile.ZipFile(tmp_path, 'r') as docx_zip:
+                        # Look for images in the media folder
+                        media_files = [f for f in docx_zip.namelist() if f.startswith('word/media/')]
+                        
+                        for media_file in media_files:
+                            try:
+                                img_data = docx_zip.read(media_file)
+                                if img_data:
+                                    # Determine image type
+                                    filename = os.path.basename(media_file)
+                                    if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                                        # Convert to data URL
+                                        if filename.lower().endswith('.png'):
+                                            content_type = 'image/png'
+                                        elif filename.lower().endswith(('.jpg', '.jpeg')):
+                                            content_type = 'image/jpeg'
+                                        elif filename.lower().endswith('.gif'):
+                                            content_type = 'image/gif'
+                                        elif filename.lower().endswith('.bmp'):
+                                            content_type = 'image/bmp'
+                                        else:
+                                            content_type = 'image/png'  # fallback
+                                        
+                                        b64_data = base64.b64encode(img_data).decode('utf-8')
+                                        data_url = f"data:{content_type};base64,{b64_data}"
+                                        
+                                        extracted_images.append({
+                                            'filename': filename,
+                                            'data_url': data_url,
+                                            'size': len(img_data),
+                                            'type': content_type
+                                        })
+                            except Exception as e:
+                                logger.warning(f"Failed to extract image {media_file}: {e}")
+                                continue
+                                
+                except Exception as ze:
+                    logger.info(f"Could not extract images from .docx ZIP: {ze}")
+            
+            # Convert with pypandoc
+            try:
+                html_content = pypandoc.convert_file(tmp_path, 'html')
+            except OSError:
+                pypandoc.download_pandoc()
+                html_content = pypandoc.convert_file(tmp_path, 'html')
+            
+            # If we extracted images, try to replace image references in the HTML
+            if extracted_images and html_content:
+                import re
+                
+                # Create a map of likely image references to data URLs
+                image_map = {}
+                for img in extracted_images:
+                    # Map various possible references
+                    filename = img['filename']
+                    base_name = os.path.splitext(filename)[0]
+                    
+                    # Common patterns that might appear in HTML
+                    possible_refs = [
+                        filename,
+                        f"word/media/{filename}",
+                        f"media/{filename}",
+                        base_name,
+                        f"image{len(image_map) + 1}",  # Sequential numbering
+                    ]
+                    
+                    for ref in possible_refs:
+                        image_map[ref] = img['data_url']
+                
+                # Replace image src attributes in HTML
+                def replace_img_src(match):
+                    full_tag = match.group(0)
+                    src_match = re.search(r'src=["\']([^"\']+)["\']', full_tag)
+                    if src_match:
+                        original_src = src_match.group(1)
+                        # Try to find a matching data URL
+                        for ref, data_url in image_map.items():
+                            if ref.lower() in original_src.lower() or original_src.lower() in ref.lower():
+                                return full_tag.replace(original_src, data_url)
+                    return full_tag
+                
+                # Apply image replacement
+                html_content = re.sub(r'<img[^>]*>', replace_img_src, html_content, flags=re.IGNORECASE)
+                
+                # If no images were found in HTML but we have extracted images, append them
+                if not re.search(r'<img[^>]*>', html_content, re.IGNORECASE) and extracted_images:
+                    images_html = '<div style="margin-top:20px;"><h4>Document Images:</h4>'
+                    for img in extracted_images:
+                        images_html += f'<img src="{img["data_url"]}" alt="{img["filename"]}" style="max-width:100%;margin:10px 0;" />'
+                    images_html += '</div>'
+                    html_content += images_html
+            
+            # Add basic styling
+            if html_content:
+                styled_html = f"""
+                <style>
+                    img {{
+                        max-width: 100%;
+                        height: auto;
+                        display: block;
+                        margin: 8px 0;
+                    }}
+                    .doc-image {{
+                        max-width: 100%;
+                        height: auto;
+                    }}
+                </style>
+                {html_content}
+                """
+                
+                # Log extraction results
+                if extracted_images:
+                    total_size = sum(img['size'] for img in extracted_images)
+                    image_types = list(set(img['type'] for img in extracted_images))
+                    logger.info(f"pypandoc extracted {len(extracted_images)} images "
+                               f"(total size: {total_size} bytes, types: {image_types})")
+                else:
+                    logger.info("No images found in document")
+                
+                return styled_html
+            
+            return html_content or ""
+            
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Error in convert_doc_with_pypandoc_and_images: {e}")
+        raise
+
+def convert_docx_to_html_with_images(docx_data: bytes) -> str:
+    """Convert .docx to HTML with embedded images as data URLs.
+    
+    Uses mammoth with custom image converter to extract all images
+    and embed them as base64 data URLs for self-contained HTML.
+    """
+    try:
+        import mammoth
+        import base64
+        import io
+        from typing import Dict, Any
+        
+        # Track extracted images for logging
+        extracted_images = []
+        
+        def convert_image(image):
+            """Custom image converter that extracts images as data URLs."""
+            try:
+                # Get image bytes and metadata
+                image_bytes = image.open().read()
+                content_type = getattr(image, 'content_type', None)
+                
+                # Infer content type from image bytes if not provided
+                if not content_type:
+                    # Simple image type detection
+                    if image_bytes.startswith(b'\x89PNG'):
+                        content_type = 'image/png'
+                    elif image_bytes.startswith(b'\xff\xd8\xff'):
+                        content_type = 'image/jpeg'
+                    elif image_bytes.startswith(b'GIF'):
+                        content_type = 'image/gif'
+                    elif image_bytes.startswith(b'RIFF') and b'WEBP' in image_bytes[:20]:
+                        content_type = 'image/webp'
+                    elif image_bytes.startswith(b'BM'):
+                        content_type = 'image/bmp'
+                    else:
+                        content_type = 'image/png'  # Default fallback
+                
+                # Convert to base64 data URL
+                b64_data = base64.b64encode(image_bytes).decode('utf-8')
+                data_url = f"data:{content_type};base64,{b64_data}"
+                
+                # Track for logging
+                extracted_images.append({
+                    'size': len(image_bytes),
+                    'type': content_type,
+                    'alt_text': getattr(image, 'alt_text', '') or 'Image from Word document'
+                })
+                
+                # Return the data URL for mammoth to use in HTML
+                return {
+                    "src": data_url,
+                    "alt": getattr(image, 'alt_text', '') or 'Image from Word document'
+                }
+                
+            except Exception as e:
+                logger.warning(f"Failed to convert image: {e}")
+                # Return empty dict to skip this image
+                return {}
+        
+        # Configure mammoth with image conversion
+        convert_options = {
+            'convert_image': mammoth.images.img_element(convert_image),
+            'ignore_empty_paragraphs': False,
+            'preserve_empty_paragraphs': True
+        }
+        
+        # Convert the .docx bytes to HTML
+        with io.BytesIO(docx_data) as docx_stream:
+            result = mammoth.convert_to_html(docx_stream, **convert_options)
+            html_content = result.value
+            
+            # Log any conversion messages (warnings/errors)
+            if result.messages:
+                for msg in result.messages:
+                    if msg.type == 'warning':
+                        logger.warning(f"Mammoth warning: {msg.message}")
+                    elif msg.type == 'error':
+                        logger.error(f"Mammoth error: {msg.message}")
+        
+        # Add CSS styling for better image rendering
+        styled_html = f"""
+        <style>
+            img {{
+                max-width: 100%;
+                height: auto;
+                display: block;
+                margin: 8px 0;
+            }}
+            .word-image {{
+                max-width: 100%;
+                height: auto;
+            }}
+        </style>
+        {html_content}
+        """
+        
+        # Log extraction results
+        if extracted_images:
+            total_size = sum(img['size'] for img in extracted_images)
+            image_types = list(set(img['type'] for img in extracted_images))
+            logger.info(f"Mammoth extracted {len(extracted_images)} images "
+                       f"(total size: {total_size} bytes, types: {image_types})")
+        else:
+            logger.info("No images found in .docx document")
+        
+        return styled_html
+        
+    except Exception as e:
+        logger.error(f"Error in convert_docx_to_html_with_images: {e}")
+        raise
+
 def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
     """Convert .doc/.docx bytes to PDF bytes.
 
@@ -116,32 +386,20 @@ def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
             html_content = None
             lower_ext = ext.lower()
 
-            # Try pypandoc first for both .doc and .docx
+            # Try pypandoc first for both .doc and .docx with image extraction
             try:
-                import pypandoc  # type: ignore
-                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                    tmp.write(data)
-                    tmp.flush()
-                    tmp_path = tmp.name
-                try:
-                    try:
-                        html_content = pypandoc.convert_file(tmp_path, 'html')
-                    except OSError:
-                        pypandoc.download_pandoc()
-                        html_content = pypandoc.convert_file(tmp_path, 'html')
-                finally:
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
+                html_content = convert_doc_with_pypandoc_and_images(data, ext)
+                if html_content:
+                    logger.info(f"pypandoc conversion successful with potential image extraction")
             except Exception as pe:
                 logger.warning(f"pypandoc conversion failed: {pe}")
 
-            # Fallback to mammoth for .docx
+            # Fallback to mammoth for .docx with image support
             if not html_content and lower_ext == '.docx':
                 try:
                     import mammoth  # type: ignore
-                    html_content = mammoth.convert_to_html(io.BytesIO(data)).value
+                    html_content = convert_docx_to_html_with_images(data)
+                    logger.info(f"mammoth conversion successful with image extraction")
                 except Exception as me:
                     logger.warning(f"mammoth conversion failed: {me}")
 
@@ -1138,7 +1396,6 @@ def extract_body_and_images_from_email(msg):
                         except Exception:
                             pass
                         try:
-                            import os
                             base = os.path.basename(fname)
                             if base:
                                 keys.add(base)
