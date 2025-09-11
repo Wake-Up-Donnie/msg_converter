@@ -134,44 +134,102 @@ class EMLToPDFConverter:
             return 'Unknown Date'
 
     def convert_office_to_pdf(self, data: bytes, ext: str) -> bytes | None:
-        """Convert .doc/.docx bytes to PDF bytes using LibreOffice if available."""
+        """Convert .doc/.docx bytes to PDF bytes.
+
+        First tries to use LibreOffice (if installed). If that fails, fall back to
+        pure-Python approaches for .docx (via ``mammoth``) and .doc (via
+        the ``antiword`` command) and render the resulting HTML/text to PDF using the existing
+        ``html_to_pdf`` helper.
+        """
+        src_path = None
+        out_dir = None
+        pdf_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as src:
                 src.write(data)
                 src.flush()
+                src_path = src.name
             out_dir = tempfile.mkdtemp()
             cmd = [
                 'libreoffice',
                 '--headless',
                 '--convert-to',
                 'pdf',
-                src.name,
+                src_path,
                 '--outdir',
                 out_dir,
             ]
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             pdf_path = os.path.join(
-                out_dir, os.path.splitext(os.path.basename(src.name))[0] + '.pdf'
+                out_dir, os.path.splitext(os.path.basename(src_path))[0] + '.pdf'
             )
             with open(pdf_path, 'rb') as f:
                 return f.read()
         except Exception as e:
             logger.warning(f"DOC/DOCX conversion failed: {e}")
+            # Fallback for environments without LibreOffice
+            try:
+                html_content = None
+                lower_ext = ext.lower()
+                if lower_ext == '.docx':
+                    try:
+                        import mammoth  # type: ignore
+                        html_content = mammoth.convert_to_html(io.BytesIO(data)).value
+                    except Exception as me:
+                        logger.warning(f"mammoth conversion failed: {me}")
+                elif lower_ext == '.doc':
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                            tmp.write(data)
+                            tmp.flush()
+                            tmp_path = tmp.name
+                        try:
+                            # antiword outputs plain text; if unavailable this will fail
+                            result = subprocess.run(
+                                ['antiword', tmp_path],
+                                check=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                            )
+                            text = result.stdout.decode('utf-8', 'replace')
+                            html_content = f"<pre>{html.escape(text)}</pre>"
+                        finally:
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                    except Exception as te:
+                        logger.warning(f"antiword conversion failed: {te}")
+
+                if html_content:
+                    tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix='.pdf')
+                    os.close(tmp_pdf_fd)
+                    try:
+                        self.html_to_pdf(html_content, tmp_pdf_path)
+                        with open(tmp_pdf_path, 'rb') as f:
+                            return f.read()
+                    finally:
+                        try:
+                            os.remove(tmp_pdf_path)
+                        except Exception:
+                            pass
+            except Exception as fe:
+                logger.warning(f"Fallback DOC/DOCX conversion failed: {fe}")
             return None
         finally:
-            try:
-                os.remove(src.name)
-            except Exception:
-                pass
-            try:
-                if 'pdf_path' in locals() and os.path.exists(pdf_path):
-                    os.remove(pdf_path)
-            except Exception:
-                pass
-            try:
-                shutil.rmtree(out_dir)
-            except Exception:
-                pass
+            for p in (src_path, pdf_path):
+                if not p:
+                    continue
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            if out_dir:
+                try:
+                    shutil.rmtree(out_dir)
+                except Exception:
+                    pass
 
     def msg_bytes_to_eml_bytes(self, msg_bytes: bytes) -> bytes | None:
         """Convert Outlook .msg bytes to EML bytes."""
@@ -182,12 +240,23 @@ class EMLToPDFConverter:
                 tmp_path = tmpf.name
             try:
                 m = extract_msg.Message(tmp_path)
-                em = m.as_email()
-                if hasattr(em, 'as_bytes'):
-                    return em.as_bytes()
-                buf = io.BytesIO()
-                BytesGenerator(buf).flatten(em)
-                return buf.getvalue()
+                em = None
+                if hasattr(m, 'as_email'):
+                    try:
+                        em = m.as_email()
+                    except Exception:
+                        em = None
+                if em is None and hasattr(m, 'asEmailMessage'):
+                    try:
+                        em = m.asEmailMessage()
+                    except Exception:
+                        em = None
+                if em is not None:
+                    if hasattr(em, 'as_bytes'):
+                        return em.as_bytes()
+                    buf = io.BytesIO()
+                    BytesGenerator(buf).flatten(em)
+                    return buf.getvalue()
             finally:
                 try:
                     os.remove(tmp_path)
