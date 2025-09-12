@@ -14,3 +14,4 @@ olefile
 tzlocal
 mammoth==1.6.0
 pypandoc-binary==1.13
+cryptography==41.0.7  # Pin to include ARC4 for legacy deps
