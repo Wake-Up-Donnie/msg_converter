@@ -1801,6 +1801,18 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     body = body.replace('\n', '<br>')
             body = normalize_whitespace(body)
         logger.info(f"Body extracted. Length={len(body)}")
+        # Strip outer HTML tags if body is a full HTML document to preserve layout
+        try:
+            if re.search(r"<\s*html", body, re.IGNORECASE):
+                match = re.search(r"<\s*body[^>]*>(.*)</\s*body\s*>", body, flags=re.IGNORECASE | re.DOTALL)
+                if match:
+                    body = match.group(1)
+                else:
+                    body = re.sub(r"</?html[^>]*>", "", body, flags=re.IGNORECASE)
+                    body = re.sub(r"</?body[^>]*>", "", body, flags=re.IGNORECASE)
+                logger.info("Stripped outer HTML tags from body")
+        except Exception as e:
+            logger.warning(f"Failed to strip outer HTML tags: {e}")
         # Prepare optional inline attachment note (avoid automated-looking header pages in final PDF)
         try:
             _pdf_att_meta = [
