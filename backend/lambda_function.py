@@ -29,6 +29,188 @@ import subprocess
 # level and add a handler if none exists so INFO logs always reach CloudWatch.
 ############################################
 
+
+def extract_msg_attachments_with_embedded(msg_path: str, output_dir: str) -> list:
+    """
+    Extract attachments from .msg file, including embedded .msg files.
+    Returns list of attachment dictionaries with filename, content_type, and data.
+    """
+    import extract_msg
+    import os
+    import tempfile
+    
+    try:
+        logger = globals().get('logger')
+        if logger:
+            logger.info(f"Extracting attachments from: {msg_path}")
+        
+        attachments = []
+        
+        # Open the .msg file
+        with extract_msg.Message(msg_path) as msg:
+            
+            # Process regular attachments first
+            for attachment in msg.attachments:
+                try:
+                    if hasattr(attachment, 'type') and attachment.type == "data":
+                        # Regular file attachment
+                        att_data = attachment.data
+                        att_name = getattr(attachment, 'longFilename', None) or getattr(attachment, 'shortFilename', 'unknown')
+                        
+                        # Determine content type
+                        if att_name.lower().endswith('.pdf'):
+                            content_type = 'application/pdf'
+                        elif att_name.lower().endswith(('.jpg', '.jpeg')):
+                            content_type = 'image/jpeg'  
+                        elif att_name.lower().endswith('.png'):
+                            content_type = 'image/png'
+                        else:
+                            content_type = 'application/octet-stream'
+                            
+                        attachments.append({
+                            'filename': att_name,
+                            'content_type': content_type,
+                            'data': att_data
+                        })
+                        
+                        if logger:
+                            logger.info(f"Successfully extracted regular attachment: {att_name} ({len(att_data)} bytes)")
+                
+                    elif hasattr(attachment, 'type') and attachment.type == "msg":
+                        # Embedded .msg attachment - extract inner content
+                        try:
+                            embedded_msg = attachment.data
+                            att_name = getattr(attachment, 'longFilename', None) or getattr(attachment, 'shortFilename', 'embedded_message.msg')
+                            
+                            # Use extract-msg's save method to extract embedded content
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                save_result = embedded_msg.save(customPath=temp_dir, useFileName=True)
+                                
+                                if logger:
+                                    logger.info(f"Items created by save(): {save_result}")
+                                
+                                # Look for extracted files in the directory structure
+                                for root, dirs, files in os.walk(temp_dir):
+                                    if logger:
+                                        logger.info(f"Files inside extracted dir: {files}")
+                                    
+                                    # Prefer .eml or .msg content if present
+                                    for filename in files:
+                                        try:
+                                            lower = filename.lower()
+                                            file_path = os.path.join(root, filename)
+                                            if lower.endswith('.eml'):
+                                                with open(file_path, 'rb') as f:
+                                                    eml_bytes = f.read()
+                                                # Preserve as message/rfc822 so we can render to PDF later
+                                                final_name = att_name if att_name.lower().endswith('.eml') else os.path.splitext(att_name)[0] + '.eml'
+                                                attachments.append({
+                                                    'filename': final_name,
+                                                    'content_type': 'message/rfc822',
+                                                    'data': eml_bytes,
+                                                })
+                                                if logger:
+                                                    logger.info(f"Successfully extracted embedded EML: {final_name} ({len(eml_bytes)} bytes)")
+                                                # Once we have an EML for this embedded message, skip searching for text fallbacks
+                                                raise StopIteration
+                                            if lower.endswith('.msg'):
+                                                with open(file_path, 'rb') as f:
+                                                    msg_bytes = f.read()
+                                                # Convert embedded .msg to EML bytes
+                                                try:
+                                                    eml_bytes = convert_msg_bytes_to_eml_bytes(msg_bytes)
+                                                    final_name = os.path.splitext(att_name)[0] + '.eml'
+                                                    attachments.append({
+                                                        'filename': final_name,
+                                                        'content_type': 'message/rfc822',
+                                                        'data': eml_bytes,
+                                                    })
+                                                    if logger:
+                                                        logger.info(f"Converted embedded MSG to EML: {final_name} ({len(eml_bytes)} bytes)")
+                                                    raise StopIteration
+                                                except Exception as conv_e:
+                                                    if logger:
+                                                        logger.warning(f"Failed converting embedded .msg to .eml: {conv_e}")
+                                                # If conversion failed, continue to try text fallbacks below
+                                        except StopIteration:
+                                            # Break out of outer loops for this embedded message
+                                            files = []
+                                            break
+                                        except Exception as read_any:
+                                            if logger:
+                                                logger.warning(f"Error examining extracted file '{filename}': {read_any}")
+
+                                    # If we didn't find .eml/.msg, look for readable text fallbacks
+                                    for filename in files:
+                                        if filename in ['message.txt', 'message.html', 'body.txt', 'body.html']:
+                                            file_path = os.path.join(root, filename)
+                                            try:
+                                                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                                                    text_content = f.read()
+                                                    
+                                                if text_content.strip():
+                                                    # Create attachment for the extracted text content
+                                                    text_filename = f"{att_name}.txt"
+                                                    attachments.append({
+                                                        'filename': text_filename,
+                                                        'content_type': 'text/plain',
+                                                        'data': text_content.encode('utf-8')
+                                                    })
+                                                    
+                                                    if logger:
+                                                        logger.info(f"Successfully read embedded message from '{filename}' ({len(text_content)} bytes)")
+                                                        logger.info(f"Successfully extracted embedded attachment: {text_filename} ({len(text_content)} bytes, type: text/plain)")
+                                                        logger.info(f"TEXT ATTACHMENT DEBUG: Extracted {text_filename} with {len(text_content)} bytes of text content")
+                                                    break
+                                            except Exception as read_e:
+                                                if logger:
+                                                    logger.warning(f"Could not read {filename}: {read_e}")
+                        
+                        except Exception as embedded_e:
+                            if logger:
+                                logger.warning(f"Failed to extract embedded .msg: {embedded_e}")
+                                
+                except Exception as att_e:
+                    if logger:
+                        logger.warning(f"Failed to process attachment: {att_e}")
+                    
+        return attachments
+        
+    except Exception as e:
+        if logger:
+            logger.error(f"Error extracting .msg attachments: {e}")
+        return []
+
+def convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes: bytes) -> tuple[bytes, list]:
+    """
+    Convert Outlook .msg bytes into RFC 822 EML bytes and extract attachments.
+    Returns tuple of (eml_bytes, attachments_list).
+    """
+    import tempfile
+    try:
+        import extract_msg
+        
+        # Create temporary directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Write .msg to temporary file
+            msg_path = os.path.join(temp_dir, 'input.msg')
+            with open(msg_path, 'wb') as f:
+                f.write(msg_bytes)
+            
+            # Extract attachments using proper extract-msg API
+            attachments_dir = os.path.join(temp_dir, 'attachments')
+            extracted_attachments = extract_msg_attachments_with_embedded(msg_path, attachments_dir)
+            
+            # Convert main message to EML
+            eml_bytes = convert_msg_bytes_to_eml_bytes(msg_bytes)
+            
+            return eml_bytes, extracted_attachments
+            
+    except Exception as e:
+        logger.error(f"Failed to extract .msg with attachments: {e}")
+        # Fallback to basic conversion
+        return convert_msg_bytes_to_eml_bytes(msg_bytes), []
+
 def _configure_logging():
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     root = logging.getLogger()
@@ -1570,8 +1752,10 @@ def _extract_display_date(msg) -> str:
     return 'Unknown Date'
 
 
-def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: str = None) -> bool:
+def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: str = None, msg_attachments: list = None) -> bool:
     """Convert EML content to PDF using Playwright with fallback to FPDF."""
+    import html  # Import html module to avoid variable conflict
+    import tempfile  # Import tempfile module to avoid variable conflict
     logger.info("=== CONVERT_EML_TO_PDF STARTED ===")
     
     try:
@@ -1758,8 +1942,132 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 logger.error("Body PDF generation failed or empty")
                 return False
 
-            # If no PDF attachments, move body to output and finish
+            # Collect PDF attachments from both EML parsing and extracted .msg attachments
             pdf_attachments = [a for a in (attachments or []) if a.get('content_type') == 'application/pdf' or str(a.get('filename','')).lower().endswith('.pdf')]
+            
+            # Process .msg attachments (embedded .msg files and other PDFs from extract-msg)
+            logger.info(f"MSG ATTACHMENTS PARAMETER: {msg_attachments is not None}, LENGTH: {len(msg_attachments) if msg_attachments else 0}")
+            if msg_attachments:
+                logger.info(f"PROCESSING {len(msg_attachments)} MSG ATTACHMENTS FOR PDF CONVERSION")
+                for i, att in enumerate(msg_attachments):
+                    att_filename = att.get('filename', 'unknown')
+                    att_content_type = att.get('content_type', 'unknown')
+                    att_size = len(att.get('data', b''))
+                    logger.info(f"MSG ATTACHMENT {i+1}: {att_filename} (type: {att_content_type}, size: {att_size} bytes)")
+                    
+                    if att.get('content_type') == 'application/pdf' or str(att.get('filename','')).lower().endswith('.pdf'):
+                        # Already a PDF - add directly to pdf_attachments
+                        pdf_attachments.append(att)
+                        logger.info(f"Added PDF attachment: {att_filename}")
+                    elif (str(att.get('content_type','')).lower() == 'message/rfc822' or str(att.get('filename','')).lower().endswith('.eml')) and att.get('data'):
+                        # Convert embedded EML into a PDF and append
+                        try:
+                            eml_bytes = att.get('data')
+                            if not isinstance(eml_bytes, (bytes, bytearray)):
+                                # In case something weird passed through
+                                eml_bytes = bytes(eml_bytes)
+                            nested_pdf = eml_bytes_to_pdf_bytes(eml_bytes)
+                            if nested_pdf:
+                                base_name = os.path.splitext(att_filename or f"attachment-{len(pdf_attachments)+1}")[0]
+                                out_name = f"{base_name}.pdf"
+                                pdf_attachments.append({
+                                    'filename': out_name,
+                                    'content_type': 'application/pdf',
+                                    'data': nested_pdf
+                                })
+                                logger.info(f"Converted embedded EML to PDF: {out_name} ({len(nested_pdf)} bytes)")
+                            else:
+                                logger.warning(f"Failed to convert embedded EML to PDF: {att_filename}")
+                        except Exception as eml_e:
+                            logger.warning(f"Error converting embedded EML {att_filename} to PDF: {eml_e}")
+                    elif att.get('content_type') == 'text/plain' and str(att.get('filename', '')).lower().endswith('.txt'):
+                        # Convert embedded message text to PDF
+                        try:
+                            att_data = att.get('data', b'')
+                            if isinstance(att_data, bytes):
+                                text_content = att_data.decode('utf-8', errors='replace')
+                            else:
+                                text_content = str(att_data)
+                            
+                            if text_content.strip():
+                                # Create formatted HTML for the embedded message
+                                base_name = os.path.splitext(att_filename)[0]
+                                if base_name.endswith('.msg'):
+                                    base_name = base_name[:-4]  # Remove .msg extension
+                                    
+                                html_content = f"""
+                                <!DOCTYPE html>
+                                <html lang="en">
+                                <head>
+                                    <meta charset="UTF-8">
+                                    <title>Embedded Message: {html.escape(base_name)}</title>
+                                    <style>
+                                        body {{
+                                            font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                                            line-height: 1.4;
+                                            margin: 20px;
+                                            color: #333;
+                                        }}
+                                        .embedded-header {{
+                                            background-color: #f0f8ff;
+                                            border: 1px solid #4CAF50;
+                                            border-radius: 5px;
+                                            padding: 15px;
+                                            margin-bottom: 20px;
+                                        }}
+                                        .embedded-content {{
+                                            white-space: pre-wrap;
+                                            word-wrap: break-word;
+                                        }}
+                                    </style>
+                                </head>
+                                <body>
+                                    <div class="embedded-header">
+                                        <h2>📎 Embedded Message: {html.escape(base_name)}</h2>
+                                    </div>
+                                    <div class="embedded-content">{html.escape(text_content)}</div>
+                                </body>
+                                </html>
+                                """
+                                
+                                # Generate PDF from HTML
+                                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_nested:
+                                    pdf_path = tmp_nested.name
+                                
+                                try:
+                                    # Try Playwright first, fallback to FPDF
+                                    if os.environ.get('TEST_MODE', '').lower() == 'true':
+                                        nested_ok = fallback_html_to_pdf(html_content, pdf_path)
+                                    else:
+                                        try:
+                                            nested_ok = html_to_pdf_playwright(html_content, pdf_path, twemoji_base_url)
+                                        except Exception:
+                                            nested_ok = fallback_html_to_pdf(html_content, pdf_path)
+                                    
+                                    if nested_ok and os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                                        # Read the generated PDF and add to attachments
+                                        with open(pdf_path, 'rb') as f:
+                                            nested_pdf_bytes = f.read()
+                                        
+                                        pdf_attachments.append({
+                                            'filename': f"{base_name}.pdf",
+                                            'content_type': 'application/pdf',
+                                            'data': nested_pdf_bytes
+                                        })
+                                        logger.info(f"Successfully converted text attachment to PDF: {base_name}.pdf ({len(nested_pdf_bytes)} bytes)")
+                                    else:
+                                        logger.warning(f"Failed to convert text attachment to PDF: {att_filename}")
+                                        
+                                finally:
+                                    if os.path.exists(pdf_path):
+                                        os.unlink(pdf_path)
+                                        
+                        except Exception as text_e:
+                            logger.warning(f"Error converting text attachment {att_filename} to PDF: {text_e}")
+                    else:
+                        logger.info(f"Skipping non-PDF attachment: {att_filename} (type: {att_content_type})")
+            
+            # If no PDF attachments after processing, move body to output and finish
             if not pdf_attachments:
                 shutil.copyfile(body_pdf_path, output_path)
                 logger.info("No PDF attachments found; body PDF copied to output")
@@ -2383,12 +2691,14 @@ def handle_convert(event: Dict[str, Any]) -> Dict[str, Any]:
                 'body': json.dumps({'error': 'File must be a .eml or .msg file'})
             }
 
-        # If .msg, convert to .eml bytes first
+        # If .msg, convert to .eml bytes and extract attachments first
+        msg_attachments = []
         if ext == '.msg':
             try:
-                logger.info("Detected .msg file - converting to EML bytes...")
-                eml_source = convert_msg_bytes_to_eml_bytes(file_content)
+                logger.info("Detected .msg file - converting to EML bytes and extracting attachments...")
+                eml_source, msg_attachments = convert_msg_bytes_to_eml_bytes_with_attachments(file_content)
                 logger.info(f".msg converted to EML: {len(eml_source) if eml_source else 0} bytes")
+                logger.info(f"Extracted {len(msg_attachments)} attachments from .msg file")
             except Exception as e:
                 logger.error(f".msg conversion failed: {e}")
                 return {
@@ -2455,7 +2765,7 @@ def handle_convert(event: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             # Convert EML to PDF
-            success = convert_eml_to_pdf(eml_source, tmp_pdf_path, twemoji_base_url)
+            success = convert_eml_to_pdf(eml_source, tmp_pdf_path, twemoji_base_url, msg_attachments)
             logger.info(f"EML to PDF conversion result: success={success}")
 
             if not success:
@@ -2865,10 +3175,12 @@ def handle_convert_s3(event: Dict[str, Any]) -> Dict[str, Any]:
                 obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                 file_bytes = obj["Body"].read()
 
-                # Convert .msg to EML bytes if needed
+                # Convert .msg to EML bytes and extract attachments if needed
+                msg_attachments = []
                 if ext == ".msg":
                     try:
-                        eml_source = convert_msg_bytes_to_eml_bytes(file_bytes)
+                        eml_source, msg_attachments = convert_msg_bytes_to_eml_bytes_with_attachments(file_bytes)
+                        logger.info(f"Extracted {len(msg_attachments)} attachments from {s3_key}")
                     except Exception as e:
                         logger.error(f".msg conversion failed for {s3_key}: {e}")
                         results.append({
@@ -2896,7 +3208,7 @@ def handle_convert_s3(event: Dict[str, Any]) -> Dict[str, Any]:
                     tmp_pdf_path = tmp_pdf.name
 
                 try:
-                    ok = convert_eml_to_pdf(eml_source, tmp_pdf_path)
+                    ok = convert_eml_to_pdf(eml_source, tmp_pdf_path, None, msg_attachments)
                     if not ok or not os.path.exists(tmp_pdf_path) or os.path.getsize(tmp_pdf_path) == 0:
                         results.append({
                             "filename": original_name,
