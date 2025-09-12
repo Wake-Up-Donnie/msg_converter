@@ -9,6 +9,7 @@ import email
 from email.parser import Parser
 from email.policy import default
 from email.generator import BytesGenerator
+from email.utils import parseaddr, parsedate_to_datetime
 from playwright.sync_api import sync_playwright
 from pypdf import PdfReader, PdfWriter
 import boto3
@@ -80,6 +81,74 @@ def unique_filename(directory: str, filename: str) -> str:
         candidate = f"{base} ({i}){ext}"
         i += 1
     return candidate
+
+def _split_display_name(display: str) -> tuple[str | None, str | None]:
+    """Parse display name returning (last_name, first_initial)."""
+    if not display:
+        return None, None
+    display = re.sub(r'\s+', ' ', display).strip().strip('"')
+    if not display:
+        return None, None
+    if ',' in display:
+        parts = [p.strip() for p in display.split(',') if p.strip()]
+        if len(parts) >= 2:
+            last_part = parts[0]
+            first_part = parts[1]
+            first_token = first_part.split()[0] if first_part else ''
+            last_token = last_part.split()[-1] if last_part else ''
+            if last_token and first_token:
+                return last_token.title(), first_token[:1].upper()
+    tokens = display.split()
+    if len(tokens) >= 2:
+        first = tokens[0]
+        last = tokens[-1]
+        return last.title(), first[:1].upper()
+    tok = tokens[0]
+    return tok.title(), tok[:1].upper()
+
+def _name_from_local_part(local: str) -> tuple[str | None, str | None]:
+    """Infer (last, first_initial) from email local-part such as 'john.q.public'."""
+    if not local:
+        return None, None
+    parts = [p for p in re.split(r'[._\-+]+', local) if p]
+    if len(parts) >= 2:
+        first = parts[0].title()
+        last = parts[-1].title()
+        return last, first[:1]
+    token = parts[0].title()
+    return token, token[:1]
+
+def extract_sender_name_and_date(eml_bytes: bytes) -> tuple[str | None, str | None, str | None]:
+    """Return (last_name, first_initial, MM-DD-YYYY) from EML bytes."""
+    try:
+        msg = email.message_from_bytes(eml_bytes, policy=default)
+    except Exception:
+        return None, None, None
+    date_hdr = msg.get('Date')
+    date_str = None
+    if date_hdr:
+        try:
+            dt = parsedate_to_datetime(date_hdr)
+            if dt:
+                date_str = f"{dt.month:02d}-{dt.day:02d}-{dt.year:04d}"
+        except Exception:
+            date_str = None
+    from_hdr = msg.get('From', '') or ''
+    display, addr = parseaddr(from_hdr)
+    last = first_initial = None
+    if display:
+        l1, f1 = _split_display_name(display)
+        if l1 and f1:
+            last, first_initial = l1, f1
+    if (not last or not first_initial) and addr:
+        local_part = addr.split('@')[0]
+        l2, f2 = _name_from_local_part(local_part)
+        if l2 and f2:
+            if not last:
+                last = l2
+            if not first_initial:
+                first_initial = f2
+    return last, first_initial, date_str
 
 class EMLToPDFConverter:
     def __init__(self):
@@ -1515,37 +1584,33 @@ def convert_files():
                 continue
 
             try:
-                # Generate unique filenames
-                safe_base = sanitize_filename(file.filename, default='email')
-                file_id = str(uuid.uuid4())
-                
-                # Handle .msg and .eml files
-                msg_attachments = []
+                file_bytes = file.read()
                 if ext == '.msg':
-                    # Save uploaded .msg file temporarily
+                    eml_bytes, msg_attachments = converter.msg_bytes_to_eml_bytes_with_attachments(file_bytes)
+                else:
+                    eml_bytes = file_bytes
+                    msg_attachments = []
+
+                last, first_initial, date_str = extract_sender_name_and_date(eml_bytes)
+                if last and first_initial and date_str:
+                    raw_base = f"{last}, {first_initial} - {date_str}"
+                    safe_base = sanitize_filename(raw_base, default='email')
+                else:
+                    safe_base = sanitize_filename(file.filename, default='email')
+
+                file_id = str(uuid.uuid4())
+
+                if ext == '.msg':
                     msg_filename = f"{safe_base}__{file_id}.msg"
                     msg_path = os.path.join(temp_dir, msg_filename)
-                    file.save(msg_path)
-                    
-                    # Read .msg file and extract attachments
-                    with open(msg_path, 'rb') as f:
-                        msg_bytes = f.read()
-                    
-                    # Convert .msg to .eml and extract attachments
-                    eml_bytes, msg_attachments = converter.msg_bytes_to_eml_bytes_with_attachments(msg_bytes)
-                    
-                    # Save converted EML temporarily
-                    eml_filename = f"{safe_base}__{file_id}.eml"
-                    eml_path = os.path.join(temp_dir, eml_filename)
-                    with open(eml_path, 'wb') as f:
-                        f.write(eml_bytes)
-                else:
-                    # Save uploaded .eml file directly
-                    eml_filename = f"{safe_base}__{file_id}.eml"
-                    eml_path = os.path.join(temp_dir, eml_filename)
-                    file.save(eml_path)
+                    with open(msg_path, 'wb') as f:
+                        f.write(file_bytes)
 
-                # Convert to PDF and save to session directory
+                eml_filename = f"{safe_base}__{file_id}.eml"
+                eml_path = os.path.join(temp_dir, eml_filename)
+                with open(eml_path, 'wb') as f:
+                    f.write(eml_bytes)
+
                 desired_pdf = f"{safe_base}.pdf"
                 pdf_filename = unique_filename(session_dir, desired_pdf)
                 pdf_path = os.path.join(session_dir, pdf_filename)
