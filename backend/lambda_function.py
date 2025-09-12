@@ -1765,7 +1765,7 @@ def replace_image_references(html_content: str, images: Dict[str, str]) -> str:
         logger.warning(f"Error replacing image references: {str(e)}")
         return html_content
 
-def extract_body_and_images_from_email(msg):
+def extract_body_and_images_from_email(msg, msg_attachments=None):
     """Extract best HTML/plain body and inline images as data URLs."""
     images = {}
     attachments = []
@@ -1948,24 +1948,65 @@ def extract_body_and_images_from_email(msg):
     body = None
     logger.info(f"DEBUGGING: Body selection - HTML candidates: {len(html_candidates)}, Text candidates: {len(text_candidates)}")
     
-    # CRITICAL FIX: Combine all text parts to get complete message (Dan's + Katrina's content)
+    # CRITICAL FIX: Analyze text parts to avoid duplication with embedded attachments
     if len(text_candidates) > 1:
-        logger.info(f"DEBUGGING: Multiple text parts detected - combining for complete message")
+        logger.info(f"DEBUGGING: Multiple text parts detected - analyzing for forwarded content")
         
-        # Sort by content to ensure proper order (original content usually comes first)
-        sorted_text = sorted(text_candidates, key=lambda t: (
-            0 if any(phrase in t[1][:300] for phrase in ["Good afternoon", "good afternoon", "I wanted to"]) else 1,  # Dan's content first
-            -t[0]  # Then by size (larger second)
-        ))
+        # Check if there are embedded message attachments that might duplicate forwarded content
+        local_embedded = any(a.get('content_type') == 'message/rfc822' for a in attachments)
         
-        combined_parts = []
-        for i, (length, content) in enumerate(sorted_text):
+        # Check msg_attachments parameter more thoroughly
+        msg_embedded = False
+        if msg_attachments:
+            msg_embedded = any(
+                a.get('content_type') == 'message/rfc822' or
+                str(a.get('filename', '')).lower().endswith('.eml')
+                for a in msg_attachments
+            )
+            logger.info(f"DEBUGGING: msg_attachments contains {len(msg_attachments)} items:")
+            for i, att in enumerate(msg_attachments):
+                logger.info(f"  - {i+1}: {att.get('filename')} (type: {att.get('content_type')})")
+        
+        has_embedded_msg = local_embedded or msg_embedded
+        logger.info(f"DEBUGGING: Has embedded message attachments: {has_embedded_msg} (local: {local_embedded}, msg_attachments: {msg_embedded})")
+        
+        # Analyze each text part for forwarded vs original content
+        original_parts = []
+        forwarded_parts = []
+        
+        for i, (length, content) in enumerate(text_candidates):
             preview = content[:200].replace('<br>', ' ').replace('\n', ' ')
-            logger.info(f"DEBUGGING: Combining text part {i+1} ({length} chars): {preview}...")
-            combined_parts.append(content)
+            logger.info(f"DEBUGGING: Analyzing text part {i+1} ({length} chars): {preview}...")
+            
+            # Check if this part contains forwarded message markers
+            is_forwarded = (
+                '---------- Forwarded message ---------' in content and
+                not any(phrase in content[:500] for phrase in ["Good afternoon", "good afternoon", "I wanted to"])
+            )
+            
+            if is_forwarded:
+                logger.info(f"DEBUGGING: Text part {i+1} identified as FORWARDED content (will appear as attachment)")
+                forwarded_parts.append((length, content))
+            else:
+                logger.info(f"DEBUGGING: Text part {i+1} identified as ORIGINAL content")
+                original_parts.append((length, content))
         
-        body = '<br><br>'.join(combined_parts)
-        logger.info(f"DEBUGGING: Combined text content: {len(body)} chars total")
+        # If we have embedded attachments, only use original parts to avoid duplication
+        if has_embedded_msg and original_parts:
+            logger.info(f"DEBUGGING: Using only original parts ({len(original_parts)}) - forwarded content will appear as attachment")
+            combined_parts = [content for length, content in original_parts]
+            body = '<br><br>'.join(combined_parts)
+            logger.info(f"DEBUGGING: Original-only body content: {len(body)} chars total")
+        else:
+            # No embedded attachments or no original parts found - combine all
+            logger.info(f"DEBUGGING: No embedded attachments or no original parts - combining all text parts")
+            sorted_text = sorted(text_candidates, key=lambda t: (
+                0 if any(phrase in t[1][:300] for phrase in ["Good afternoon", "good afternoon", "I wanted to"]) else 1,
+                -t[0]
+            ))
+            combined_parts = [content for length, content in sorted_text]
+            body = '<br><br>'.join(combined_parts)
+            logger.info(f"DEBUGGING: All-parts combined content: {len(body)} chars total")
         
     elif text_candidates:
         body = max(text_candidates, key=lambda t: t[0])[1]
@@ -2119,7 +2160,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         # Rich extraction: body + inline images
         logger.info("Extracting email body + inline images...")
         try:
-            body, images, attachments = extract_body_and_images_from_email(msg)
+            body, images, attachments = extract_body_and_images_from_email(msg, msg_attachments)
             logger.info(f"DEBUGGING: Rich extraction completed - body_len={len(body)}, images={len(images)}, attachments={len(attachments)}")
         except Exception as e:
             logger.error(f"Rich extraction failed: {e}")
