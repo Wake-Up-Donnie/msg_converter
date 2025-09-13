@@ -21,6 +21,12 @@ from fpdf import FPDF
 from pypdf import PdfReader, PdfWriter
 import shutil
 import subprocess
+from converter import EmailConverter
+from router import LambdaRouter
+from document_converter import DocumentConverter
+from request_parser import RequestParser
+from multipart_parser import MultipartParser
+
 
 ############################################
 # Robust logging configuration
@@ -29,374 +35,6 @@ import subprocess
 # level and add a handler if none exists so INFO logs always reach CloudWatch.
 ############################################
 
-
-def extract_msg_attachments_with_embedded(msg_path: str, output_dir: str) -> list:
-    """
-    Extract attachments from .msg file, including embedded .msg files.
-    Returns list of attachment dictionaries with filename, content_type, and data.
-    """
-    import extract_msg
-    import os
-    import tempfile
-    
-    try:
-        logger = globals().get('logger')
-        if logger:
-            logger.info(f"Extracting attachments from: {msg_path}")
-        
-        attachments = []
-        
-        # Open the .msg file
-        with extract_msg.Message(msg_path) as msg:
-            
-            if logger:
-                logger.info(f"DEBUGGING: Total attachments found: {len(msg.attachments)}")
-                for i, att in enumerate(msg.attachments):
-                    att_type = getattr(att, 'type', 'unknown')
-                    att_name = getattr(att, 'longFilename', None) or getattr(att, 'shortFilename', 'unknown')
-                    logger.info(f"DEBUGGING: Attachment {i+1}: type='{att_type}', name='{att_name}'")
-            
-            # Process regular attachments first
-            for attachment in msg.attachments:
-                try:
-                    if hasattr(attachment, 'type') and attachment.type == "data":
-                        # Regular file attachment
-                        att_data = attachment.data
-                        att_name = getattr(attachment, 'longFilename', None) or getattr(attachment, 'shortFilename', 'unknown')
-                        
-                        # Determine content type
-                        if att_name.lower().endswith('.pdf'):
-                            content_type = 'application/pdf'
-                        elif att_name.lower().endswith(('.jpg', '.jpeg')):
-                            content_type = 'image/jpeg'
-                        elif att_name.lower().endswith('.png'):
-                            content_type = 'image/png'
-                        else:
-                            content_type = 'application/octet-stream'
-                            
-                        attachments.append({
-                            'filename': att_name,
-                            'content_type': content_type,
-                            'data': att_data
-                        })
-                        
-                        if logger:
-                            logger.info(f"Successfully extracted regular attachment: {att_name} ({len(att_data)} bytes)")
-                
-                    elif hasattr(attachment, 'type') and attachment.type == "msg":
-                        # Embedded .msg attachment - extract inner content
-                        if logger:
-                            logger.info(f"DEBUGGING: Found embedded .msg attachment")
-                        try:
-                            embedded_msg = attachment.data
-                            att_name = getattr(attachment, 'longFilename', None) or getattr(attachment, 'shortFilename', 'embedded_message.msg')
-                            
-                            if logger:
-                                logger.info(f"DEBUGGING: Processing embedded .msg: {att_name}")
-                            
-                            # Try to convert the embedded .msg directly to EML bytes
-                            try:
-                                # Save embedded message to temporary file
-                                with tempfile.NamedTemporaryFile(suffix='.msg', delete=False) as tmp_file:
-                                    # embedded_msg should be a Message object, save it to bytes first
-                                    embedded_msg.save(tmp_file.name, raw=True)
-                                    tmp_file.flush()
-                                    
-                                    # Read back the .msg bytes
-                                    with open(tmp_file.name, 'rb') as f:
-                                        msg_bytes = f.read()
-                                    
-                                    # Convert to EML
-                                    eml_bytes = convert_msg_bytes_to_eml_bytes(msg_bytes)
-                                    final_name = os.path.splitext(att_name)[0] + '.eml'
-                                    
-                                    attachments.append({
-                                        'filename': final_name,
-                                        'content_type': 'message/rfc822',
-                                        'data': eml_bytes,
-                                    })
-                                    
-                                    if logger:
-                                        logger.info(f"DEBUGGING: Successfully converted embedded .msg to EML: {final_name} ({len(eml_bytes)} bytes)")
-                                    
-                                    # Clean up temp file
-                                    os.unlink(tmp_file.name)
-                                    continue
-                                    
-                            except Exception as direct_e:
-                                if logger:
-                                    logger.warning(f"DEBUGGING: Direct .msg conversion failed: {direct_e}, trying save method")
-                            
-                            # Fallback to original save method
-                            with tempfile.TemporaryDirectory() as temp_dir:
-                                save_result = embedded_msg.save(customPath=temp_dir, useFileName=True)
-                                
-                                if logger:
-                                    logger.info(f"Items created by save(): {save_result}")
-                                
-                                # Look for extracted files in the directory structure
-                                for root, dirs, files in os.walk(temp_dir):
-                                    if logger:
-                                        logger.info(f"Files inside extracted dir: {files}")
-                                    
-                                    # Prefer .eml or .msg content if present
-                                    for filename in files:
-                                        try:
-                                            lower = filename.lower()
-                                            file_path = os.path.join(root, filename)
-                                            if lower.endswith('.eml'):
-                                                with open(file_path, 'rb') as f:
-                                                    eml_bytes = f.read()
-                                                # Preserve as message/rfc822 so we can render to PDF later
-                                                final_name = att_name if att_name.lower().endswith('.eml') else os.path.splitext(att_name)[0] + '.eml'
-                                                attachments.append({
-                                                    'filename': final_name,
-                                                    'content_type': 'message/rfc822',
-                                                    'data': eml_bytes,
-                                                })
-                                                if logger:
-                                                    logger.info(f"Successfully extracted embedded EML: {final_name} ({len(eml_bytes)} bytes)")
-                                                # Once we have an EML for this embedded message, skip searching for text fallbacks
-                                                raise StopIteration
-                                            if lower.endswith('.msg'):
-                                                with open(file_path, 'rb') as f:
-                                                    msg_bytes = f.read()
-                                                # Convert embedded .msg to EML bytes
-                                                try:
-                                                    eml_bytes = convert_msg_bytes_to_eml_bytes(msg_bytes)
-                                                    final_name = os.path.splitext(att_name)[0] + '.eml'
-                                                    attachments.append({
-                                                        'filename': final_name,
-                                                        'content_type': 'message/rfc822',
-                                                        'data': eml_bytes,
-                                                    })
-                                                    if logger:
-                                                        logger.info(f"Converted embedded MSG to EML: {final_name} ({len(eml_bytes)} bytes)")
-                                                    raise StopIteration
-                                                except Exception as conv_e:
-                                                    if logger:
-                                                        logger.warning(f"Failed converting embedded .msg to .eml: {conv_e}")
-                                                # If conversion failed, continue to try text fallbacks below
-                                        except StopIteration:
-                                            # Break out of outer loops for this embedded message
-                                            files = []
-                                            break
-                                        except Exception as read_any:
-                                            if logger:
-                                                logger.warning(f"Error examining extracted file '{filename}': {read_any}")
-
-                                    # If we didn't find .eml/.msg, look for readable text fallbacks
-                                    for filename in files:
-                                        if filename in ['message.txt', 'message.html', 'body.txt', 'body.html']:
-                                            file_path = os.path.join(root, filename)
-                                            try:
-                                                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                                                    text_content = f.read()
-                                                    
-                                                if text_content.strip():
-                                                    # Create attachment for the extracted text content
-                                                    text_filename = f"{att_name}.txt"
-                                                    attachments.append({
-                                                        'filename': text_filename,
-                                                        'content_type': 'text/plain',
-                                                        'data': text_content.encode('utf-8')
-                                                    })
-                                                    
-                                                    if logger:
-                                                        logger.info(f"Successfully read embedded message from '{filename}' ({len(text_content)} bytes)")
-                                                        logger.info(f"Successfully extracted embedded attachment: {text_filename} ({len(text_content)} bytes, type: text/plain)")
-                                                        logger.info(f"TEXT ATTACHMENT DEBUG: Extracted {text_filename} with {len(text_content)} bytes of text content")
-                                                    break
-                                            except Exception as read_e:
-                                                if logger:
-                                                    logger.warning(f"Could not read {filename}: {read_e}")
-                        
-                        except Exception as embedded_e:
-                            if logger:
-                                logger.warning(f"Failed to extract embedded .msg: {embedded_e}")
-                    
-                    # ENHANCEMENT: Try alternative attachment detection methods
-                    elif not hasattr(attachment, 'type') or attachment.type not in ["data", "msg"]:
-                        if logger:
-                            logger.info(f"DEBUGGING: Found attachment with unknown/missing type, investigating...")
-                        
-                        # Try to detect if this is actually an embedded message
-                        try:
-                            att_name = getattr(attachment, 'longFilename', None) or getattr(attachment, 'shortFilename', None)
-                            
-                            if logger:
-                                logger.info(f"DEBUGGING: Investigating unknown attachment - name: '{att_name}', has_data: {hasattr(attachment, 'data')}")
-                            
-                            # Handle case where att_name is None (avoid the .lower() error)
-                            att_name_safe = att_name or 'embedded_message'
-                            
-                            # Check if it has message-like properties
-                            if hasattr(attachment, 'data') and attachment.data:
-                                # If the attachment has data and looks like it could be a message
-                                if (att_name_safe.lower().endswith('.msg') or
-                                    hasattr(attachment.data, 'save') or
-                                    hasattr(attachment.data, 'subject') or
-                                    str(getattr(attachment, 'type', '')) == '1'):  # Type '1' often indicates embedded message
-                                    
-                                    if logger:
-                                        logger.info(f"DEBUGGING: Treating unknown attachment as embedded message: {att_name_safe}")
-                                    
-                                    # Try to process as embedded message
-                                    try:
-                                        embedded_data = attachment.data
-                                        
-                                        # Try to convert the Message object directly to EML without saving to file first
-                                        if hasattr(embedded_data, 'as_email') or hasattr(embedded_data, 'asEmailMessage'):
-                                            try:
-                                                if logger:
-                                                    logger.info(f"DEBUGGING: Attempting direct conversion of embedded Message object")
-                                                
-                                                # Try to get the embedded message as EmailMessage directly
-                                                if hasattr(embedded_data, 'as_email'):
-                                                    email_obj = embedded_data.as_email()
-                                                elif hasattr(embedded_data, 'asEmailMessage'):
-                                                    email_obj = embedded_data.asEmailMessage()
-                                                else:
-                                                    raise Exception("No conversion method available")
-                                                
-                                                # Convert EmailMessage to EML bytes
-                                                buf = io.BytesIO()
-                                                BytesGenerator(buf, policy=default).flatten(email_obj)
-                                                eml_bytes = buf.getvalue()
-                                                
-                                                final_name = 'Fwd_JCSD_construction_water_sales_availablity.eml'
-                                                
-                                                attachments.append({
-                                                    'filename': final_name,
-                                                    'content_type': 'message/rfc822',
-                                                    'data': eml_bytes,
-                                                })
-                                                
-                                                if logger:
-                                                    logger.info(f"DEBUGGING: Successfully converted embedded message directly to EML: {final_name} ({len(eml_bytes)} bytes)")
-                                                
-                                                continue  # Successfully processed
-                                                
-                                            except Exception as direct_e:
-                                                if logger:
-                                                    logger.warning(f"DEBUGGING: Direct conversion failed: {direct_e}, trying save method")
-                                        
-                                        # Fallback: Try the save method with simplified approach
-                                        if hasattr(embedded_data, 'save'):
-                                            try:
-                                                # Create a simple temporary directory
-                                                with tempfile.TemporaryDirectory() as temp_extract_dir:
-                                                    if logger:
-                                                        logger.info(f"DEBUGGING: Trying save method in temp dir: {temp_extract_dir}")
-                                                    
-                                                    # Try to save with just the directory path
-                                                    save_result = embedded_data.save(customPath=temp_extract_dir, useFileName=True)
-                                                    
-                                                    if logger:
-                                                        logger.info(f"DEBUGGING: Save result: {save_result}")
-                                                    
-                                                    # Look for any .eml or .msg files created
-                                                    for root, dirs, files in os.walk(temp_extract_dir):
-                                                        if logger:
-                                                            logger.info(f"DEBUGGING: Files in {root}: {files}")
-                                                        
-                                                        for filename in files:
-                                                            if filename.lower().endswith(('.eml', '.msg')):
-                                                                file_path = os.path.join(root, filename)
-                                                                with open(file_path, 'rb') as f:
-                                                                    saved_bytes = f.read()
-                                                                
-                                                                if filename.lower().endswith('.msg'):
-                                                                    # Convert .msg to .eml
-                                                                    eml_bytes = convert_msg_bytes_to_eml_bytes(saved_bytes)
-                                                                else:
-                                                                    eml_bytes = saved_bytes
-                                                                
-                                                                final_name = 'Fwd_JCSD_construction_water_sales_availablity.eml'
-                                                                
-                                                                attachments.append({
-                                                                    'filename': final_name,
-                                                                    'content_type': 'message/rfc822',
-                                                                    'data': eml_bytes,
-                                                                })
-                                                                
-                                                                if logger:
-                                                                    logger.info(f"DEBUGGING: Successfully extracted embedded message via save: {final_name} ({len(eml_bytes)} bytes)")
-                                                                
-                                                                break
-                                                        
-                                                        if attachments:  # Found something, break outer loop
-                                                            break
-                                                    
-                                            except Exception as save_e:
-                                                if logger:
-                                                    logger.warning(f"DEBUGGING: Save method also failed: {save_e}")
-                                                
-                                    except Exception as unknown_e:
-                                        if logger:
-                                            logger.warning(f"DEBUGGING: Failed to process unknown attachment: {unknown_e}")
-                                
-                        except Exception as detect_e:
-                            if logger:
-                                logger.warning(f"DEBUGGING: Error detecting attachment type: {detect_e}")
-                                
-                except Exception as att_e:
-                    if logger:
-                        logger.warning(f"Failed to process attachment: {att_e}")
-                    
-        return attachments
-        
-    except Exception as e:
-        if logger:
-            logger.error(f"Error extracting .msg attachments: {e}")
-        return []
-
-def convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes: bytes) -> tuple[bytes, list]:
-    """
-    Convert Outlook .msg bytes into RFC 822 EML bytes and extract attachments.
-    Returns tuple of (eml_bytes, attachments_list).
-    """
-    import tempfile
-    try:
-        import extract_msg
-        
-        logger.info(f"DEBUGGING: Starting .msg conversion with {len(msg_bytes)} bytes")
-        
-        # Create temporary directory for processing
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Write .msg to temporary file
-            msg_path = os.path.join(temp_dir, 'input.msg')
-            with open(msg_path, 'wb') as f:
-                f.write(msg_bytes)
-            
-            logger.info(f"DEBUGGING: Written .msg to temp file: {msg_path}")
-            
-            # Extract attachments using proper extract-msg API
-            attachments_dir = os.path.join(temp_dir, 'attachments')
-            extracted_attachments = extract_msg_attachments_with_embedded(msg_path, attachments_dir)
-            
-            logger.info(f"DEBUGGING: Extracted {len(extracted_attachments)} attachments from main .msg")
-            for i, att in enumerate(extracted_attachments):
-                logger.info(f"DEBUGGING: Attachment {i+1}: {att.get('filename', 'unknown')} ({att.get('content_type', 'unknown')}, {len(att.get('data', b''))} bytes)")
-            
-            # Convert main message to EML
-            logger.info(f"DEBUGGING: Converting main .msg to EML...")
-            eml_bytes = convert_msg_bytes_to_eml_bytes(msg_bytes)
-            logger.info(f"DEBUGGING: Main .msg converted to EML: {len(eml_bytes)} bytes")
-            
-            # Debug: Check what's in the EML content
-            try:
-                eml_preview = eml_bytes.decode('utf-8', errors='replace')[:500]
-                logger.info(f"DEBUGGING: EML content preview: {eml_preview}")
-            except Exception as e:
-                logger.warning(f"DEBUGGING: Could not preview EML content: {e}")
-            
-            return eml_bytes, extracted_attachments
-            
-    except Exception as e:
-        logger.error(f"Failed to extract .msg with attachments: {e}")
-        # Fallback to basic conversion
-        return convert_msg_bytes_to_eml_bytes(msg_bytes), []
 
 def _configure_logging():
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -426,6 +64,19 @@ _configure_logging()
 logger = logging.getLogger(__name__)
 logger.debug("Logging configured: level=%s, handlers=%s", logging.getLevelName(logger.level), len(logging.getLogger().handlers))
 
+converter = EmailConverter(logger)
+doc_converter = DocumentConverter(logger)
+multipart_parser = MultipartParser(logger)
+
+
+def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
+    """Wrapper for EmailConverter.convert_msg_bytes_to_eml_bytes."""
+    return converter.convert_msg_bytes_to_eml_bytes(msg_bytes)
+
+
+def convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes: bytes) -> tuple[bytes, list]:
+    """Wrapper providing backward compatibility for attachment extraction."""
+    return converter.convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes)
 # Initialize S3 client
 s3_client = boto3.client('s3')
 S3_BUCKET = os.environ.get('S3_BUCKET')
@@ -434,984 +85,23 @@ S3_BUCKET = os.environ.get('S3_BUCKET')
 # Helper utilities
 # =====================
 
-def _lower_headers(headers: Dict[str, Any]) -> Dict[str, str]:
-    """Return a lowercase-keyed copy of headers for case-insensitive access."""
-    return {str(k).lower(): v for k, v in (headers or {}).items()}
-
-def _get_body_bytes(event: Dict[str, Any]) -> bytes:
-    """Return the request body as bytes, respecting isBase64Encoded."""
-    body = event.get("body", b"")
-    if event.get("isBase64Encoded"):
-        if isinstance(body, str):
-            return base64.b64decode(body)
-        return base64.b64decode(body or b"")
-    if isinstance(body, str):
-        return body.encode("utf-8", errors="ignore")
-    return body or b""
 
 def convert_doc_with_pypandoc_and_images(doc_data: bytes, ext: str) -> str:
-    """Convert .doc/.docx to HTML using pypandoc with enhanced image handling.
-    
-    Uses pypandoc to convert the document and attempts to extract images
-    from the document structure when possible.
-    """
-    try:
-        import pypandoc
-        import tempfile
-        import zipfile
-        import base64
-        import os
-        
-        # Track extracted images
-        extracted_images = []
-        
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(doc_data)
-            tmp.flush()
-            tmp_path = tmp.name
-            
-        try:
-            # For .docx files, try to extract images from the ZIP structure first
-            if ext.lower() == '.docx':
-                try:
-                    with zipfile.ZipFile(tmp_path, 'r') as docx_zip:
-                        # Look for images in the media folder
-                        media_files = [f for f in docx_zip.namelist() if f.startswith('word/media/')]
-                        
-                        for media_file in media_files:
-                            try:
-                                img_data = docx_zip.read(media_file)
-                                if img_data:
-                                    # Determine image type
-                                    filename = os.path.basename(media_file)
-                                    if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                                        # Convert to data URL
-                                        if filename.lower().endswith('.png'):
-                                            content_type = 'image/png'
-                                        elif filename.lower().endswith(('.jpg', '.jpeg')):
-                                            content_type = 'image/jpeg'
-                                        elif filename.lower().endswith('.gif'):
-                                            content_type = 'image/gif'
-                                        elif filename.lower().endswith('.bmp'):
-                                            content_type = 'image/bmp'
-                                        else:
-                                            content_type = 'image/png'  # fallback
-                                        
-                                        b64_data = base64.b64encode(img_data).decode('utf-8')
-                                        data_url = f"data:{content_type};base64,{b64_data}"
-                                        
-                                        extracted_images.append({
-                                            'filename': filename,
-                                            'data_url': data_url,
-                                            'size': len(img_data),
-                                            'type': content_type
-                                        })
-                            except Exception as e:
-                                logger.warning(f"Failed to extract image {media_file}: {e}")
-                                continue
-                                
-                except Exception as ze:
-                    logger.info(f"Could not extract images from .docx ZIP: {ze}")
-            
-            # Convert with pypandoc
-            try:
-                html_content = pypandoc.convert_file(tmp_path, 'html')
-            except OSError:
-                pypandoc.download_pandoc()
-                html_content = pypandoc.convert_file(tmp_path, 'html')
-            
-            # If we extracted images, try to replace image references in the HTML
-            if extracted_images and html_content:
-                import re
-                
-                # Create a map of likely image references to data URLs
-                image_map = {}
-                for img in extracted_images:
-                    # Map various possible references
-                    filename = img['filename']
-                    base_name = os.path.splitext(filename)[0]
-                    
-                    # Common patterns that might appear in HTML
-                    possible_refs = [
-                        filename,
-                        f"word/media/{filename}",
-                        f"media/{filename}",
-                        base_name,
-                        f"image{len(image_map) + 1}",  # Sequential numbering
-                    ]
-                    
-                    for ref in possible_refs:
-                        image_map[ref] = img['data_url']
-                
-                # Replace image src attributes in HTML
-                def replace_img_src(match):
-                    full_tag = match.group(0)
-                    src_match = re.search(r'src=["\']([^"\']+)["\']', full_tag)
-                    if src_match:
-                        original_src = src_match.group(1)
-                        # Try to find a matching data URL
-                        for ref, data_url in image_map.items():
-                            if ref.lower() in original_src.lower() or original_src.lower() in ref.lower():
-                                return full_tag.replace(original_src, data_url)
-                    return full_tag
-                
-                # Apply image replacement
-                html_content = re.sub(r'<img[^>]*>', replace_img_src, html_content, flags=re.IGNORECASE)
-                
-                # If no images were found in HTML but we have extracted images, append them
-                if not re.search(r'<img[^>]*>', html_content, re.IGNORECASE) and extracted_images:
-                    images_html = '<div style="margin-top:20px;"><h4>Document Images:</h4>'
-                    for img in extracted_images:
-                        images_html += f'<img src="{img["data_url"]}" alt="{img["filename"]}" style="max-width:100%;margin:10px 0;" />'
-                    images_html += '</div>'
-                    html_content += images_html
-            
-            # Add basic styling
-            if html_content:
-                styled_html = f"""
-                <style>
-                    img {{
-                        max-width: 100%;
-                        height: auto;
-                        display: block;
-                        margin: 8px 0;
-                    }}
-                    .doc-image {{
-                        max-width: 100%;
-                        height: auto;
-                    }}
-                </style>
-                {html_content}
-                """
-                
-                # Log extraction results
-                if extracted_images:
-                    total_size = sum(img['size'] for img in extracted_images)
-                    image_types = list(set(img['type'] for img in extracted_images))
-                    logger.info(f"pypandoc extracted {len(extracted_images)} images "
-                               f"(total size: {total_size} bytes, types: {image_types})")
-                else:
-                    logger.info("No images found in document")
-                
-                return styled_html
-            
-            return html_content or ""
-            
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-                
-    except Exception as e:
-        logger.error(f"Error in convert_doc_with_pypandoc_and_images: {e}")
-        raise
+    return doc_converter.convert_doc_with_pypandoc_and_images(doc_data, ext)
 
 def convert_docx_to_html_with_images(docx_data: bytes) -> str:
-    """Convert .docx to HTML with embedded images as data URLs.
-    
-    Uses mammoth with custom image converter to extract all images
-    and embed them as base64 data URLs for self-contained HTML.
-    """
-    try:
-        import mammoth
-        import base64
-        import io
-        from typing import Dict, Any
-        
-        # Track extracted images for logging
-        extracted_images = []
-        
-        def convert_image(image):
-            """Custom image converter that extracts images as data URLs."""
-            try:
-                # Get image bytes and metadata
-                image_bytes = image.open().read()
-                content_type = getattr(image, 'content_type', None)
-                
-                # Infer content type from image bytes if not provided
-                if not content_type:
-                    # Simple image type detection
-                    if image_bytes.startswith(b'\x89PNG'):
-                        content_type = 'image/png'
-                    elif image_bytes.startswith(b'\xff\xd8\xff'):
-                        content_type = 'image/jpeg'
-                    elif image_bytes.startswith(b'GIF'):
-                        content_type = 'image/gif'
-                    elif image_bytes.startswith(b'RIFF') and b'WEBP' in image_bytes[:20]:
-                        content_type = 'image/webp'
-                    elif image_bytes.startswith(b'BM'):
-                        content_type = 'image/bmp'
-                    else:
-                        content_type = 'image/png'  # Default fallback
-                
-                # Convert to base64 data URL
-                b64_data = base64.b64encode(image_bytes).decode('utf-8')
-                data_url = f"data:{content_type};base64,{b64_data}"
-                
-                # Track for logging
-                extracted_images.append({
-                    'size': len(image_bytes),
-                    'type': content_type,
-                    'alt_text': getattr(image, 'alt_text', '') or 'Image from Word document'
-                })
-                
-                # Return the data URL for mammoth to use in HTML
-                return {
-                    "src": data_url,
-                    "alt": getattr(image, 'alt_text', '') or 'Image from Word document'
-                }
-                
-            except Exception as e:
-                logger.warning(f"Failed to convert image: {e}")
-                # Return empty dict to skip this image
-                return {}
-        
-        # Configure mammoth with image conversion
-        convert_options = {
-            'convert_image': mammoth.images.img_element(convert_image),
-            'ignore_empty_paragraphs': False,
-            'preserve_empty_paragraphs': True
-        }
-        
-        # Convert the .docx bytes to HTML
-        with io.BytesIO(docx_data) as docx_stream:
-            result = mammoth.convert_to_html(docx_stream, **convert_options)
-            html_content = result.value
-            
-            # Log any conversion messages (warnings/errors)
-            if result.messages:
-                for msg in result.messages:
-                    if msg.type == 'warning':
-                        logger.warning(f"Mammoth warning: {msg.message}")
-                    elif msg.type == 'error':
-                        logger.error(f"Mammoth error: {msg.message}")
-        
-        # Add CSS styling for better image rendering
-        styled_html = f"""
-        <style>
-            img {{
-                max-width: 100%;
-                height: auto;
-                display: block;
-                margin: 8px 0;
-            }}
-            .word-image {{
-                max-width: 100%;
-                height: auto;
-            }}
-        </style>
-        {html_content}
-        """
-        
-        # Log extraction results
-        if extracted_images:
-            total_size = sum(img['size'] for img in extracted_images)
-            image_types = list(set(img['type'] for img in extracted_images))
-            logger.info(f"Mammoth extracted {len(extracted_images)} images "
-                       f"(total size: {total_size} bytes, types: {image_types})")
-        else:
-            logger.info("No images found in .docx document")
-        
-        return styled_html
-        
-    except Exception as e:
-        logger.error(f"Error in convert_docx_to_html_with_images: {e}")
-        raise
+    return doc_converter.convert_docx_to_html_with_images(docx_data)
 
 def convert_office_to_pdf(data: bytes, ext: str) -> bytes | None:
-    """Convert .doc/.docx bytes to PDF bytes.
-
-    Uses LibreOffice if available. If that fails (e.g. binary missing), fall back
-    to ``pypandoc`` if available, then to ``mammoth`` for ``.docx`` or a
-    best-effort text extraction for ``.doc`` via the ``antiword`` command. The
-    resulting HTML/text is rendered to PDF using :func:`html_to_pdf`.
-    """
-    src_path = None
-    out_dir = None
-    pdf_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as src:
-            src.write(data)
-            src.flush()
-            src_path = src.name
-        out_dir = tempfile.mkdtemp()
-        cmd = [
-            'libreoffice',
-            '--headless',
-            '--convert-to',
-            'pdf',
-            src_path,
-            '--outdir',
-            out_dir,
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        pdf_path = os.path.join(out_dir, os.path.splitext(os.path.basename(src_path))[0] + '.pdf')
-        with open(pdf_path, 'rb') as f:
-            return f.read()
-    except Exception as e:
-        logger.warning(f"DOC/DOCX conversion failed: {e}")
-        try:
-            html_content = None
-            lower_ext = ext.lower()
-
-            # Try pypandoc first for both .doc and .docx with image extraction
-            try:
-                html_content = convert_doc_with_pypandoc_and_images(data, ext)
-                if html_content:
-                    logger.info(f"pypandoc conversion successful with potential image extraction")
-            except Exception as pe:
-                logger.warning(f"pypandoc conversion failed: {pe}")
-
-            # Fallback to mammoth for .docx with image support
-            if not html_content and lower_ext == '.docx':
-                try:
-                    import mammoth  # type: ignore
-                    html_content = convert_docx_to_html_with_images(data)
-                    logger.info(f"mammoth conversion successful with image extraction")
-                except Exception as me:
-                    logger.warning(f"mammoth conversion failed: {me}")
-
-            # Or antiword for .doc
-            if not html_content and lower_ext == '.doc':
-                try:
-                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                        tmp.write(data)
-                        tmp.flush()
-                        tmp_path = tmp.name
-                    try:
-                        # antiword outputs plain text; if unavailable this will fail
-                        result = subprocess.run(
-                            ['antiword', tmp_path],
-                            check=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                        )
-                        text = result.stdout.decode('utf-8', 'replace')
-                        html_content = f"<pre>{html.escape(text)}</pre>"
-                    finally:
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
-                except Exception as te:
-                    logger.warning(f"antiword conversion failed: {te}")
-
-            if html_content:
-                tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix='.pdf')
-                os.close(tmp_pdf_fd)
-                try:
-                    html_to_pdf_playwright(html_content, tmp_pdf_path)
-                    with open(tmp_pdf_path, 'rb') as f:
-                        return f.read()
-                finally:
-                    try:
-                        os.remove(tmp_pdf_path)
-                    except Exception:
-                        pass
-        except Exception as fe:
-            logger.warning(f"Fallback DOC/DOCX conversion failed: {fe}")
-        return None
-    finally:
-        for p in (src_path, pdf_path):
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-        if out_dir:
-            try:
-                shutil.rmtree(out_dir)
-            except Exception:
-                pass
+    return doc_converter.convert_office_to_pdf(data, ext)
 
 def eml_bytes_to_pdf_bytes(eml_bytes: bytes) -> bytes | None:
-    """Convert EML bytes to PDF bytes using convert_eml_to_pdf helper."""
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
-            pdf_path = tmp_pdf.name
-        ok = convert_eml_to_pdf(eml_bytes, pdf_path)
-        if ok and os.path.exists(pdf_path):
-            with open(pdf_path, 'rb') as f:
-                return f.read()
-        return None
-    except Exception as e:
-        logger.warning(f"EML to PDF conversion failed: {e}")
-        return None
-    finally:
-        try:
-            if 'pdf_path' in locals() and os.path.exists(pdf_path):
-                os.remove(pdf_path)
-        except Exception:
-            pass
-
-# =====================
-# Multipart parsing
-# =====================
-
-def _extract_boundary(content_type: str, body: bytes) -> str | None:
-    """
-    Try to extract multipart boundary from the Content-Type header, or sniff it from the body.
-    Returns the boundary token WITHOUT the leading '--'.
-    """
-    try:
-        import re
-        # 1) From header (case-insensitive), e.g. boundary=----WebKitFormBoundaryabc123 or "----WebKit..."
-        m = re.search(r'boundary=(?:"?)([^;"]+)', content_type or "", re.IGNORECASE)
-        if m:
-            b = m.group(1).strip()
-            if b:
-                return b
-
-        # 2) Sniff from body (look for leading boundary line)
-        sample = (body or b"")[:4096]
-        if sample.startswith(b"--"):
-            line_end = sample.find(b"\r\n")
-            if line_end == -1:
-                line_end = sample.find(b"\n")
-            if line_end != -1 and line_end > 2:
-                first_line = sample[2:line_end]  # skip the initial '--'
-                token = first_line.decode("utf-8", "ignore").strip()
-                if token:
-                    return token
-
-        # 3) Common WebKit token present somewhere in body
-        m2 = re.search(rb'----WebKitFormBoundary[0-9A-Za-z]+', sample)
-        if m2:
-            token = m2.group(0).decode("utf-8", "ignore")
-            # Strip leading dashes for boundary token; when used, we prepend '--'
-            return token.lstrip("-")
-    except Exception:
-        pass
-    return None
-
-def parse_multipart_data_strict(body: bytes, content_type: str) -> Dict[str, Any]:
-    """
-    Parse multipart/form-data using python-multipart (import path 'multipart').
-    Falls back to single-file mode when boundary is missing.
-    """
-    # First, attempt robust boundary extraction from header or body
-    boundary = _extract_boundary(content_type or "", body or b"")
-    if boundary:
-        logger.info("Multipart: using manual parser with extracted boundary")
-        return parse_multipart_manual(body, boundary)
-
-    try:
-        # Try multiple import paths for multipart library compatibility
-        try:
-            from multipart import MultipartParser
-            from multipart.multipart import parse_options_header
-        except ImportError:
-            try:
-                from multipart import MultipartParser, parse_options_header
-            except ImportError:
-                # Fallback import method
-                import multipart
-                MultipartParser = multipart.MultipartParser
-                parse_options_header = multipart.parse_options_header
-
-        ctype, params = parse_options_header(content_type or "")
-        boundary = params.get("boundary")
-        if ctype != "multipart/form-data" or not boundary:
-            logger.warning("No boundary in Content-Type; using single-file fallback")
-            return parse_single_file_fallback(body, content_type)
-
-        parser = MultipartParser(body, boundary)
-        files: Dict[str, Any] = {}
-        for part in parser.parts():
-            disp = part.headers.get(b"Content-Disposition", b"").decode("utf-8", "replace")
-            _, opts = parse_options_header(disp)
-            name = (opts.get("name") or "").strip('"')
-            filename = opts.get("filename")
-            if filename:
-                files[name or "file"] = {
-                    "filename": filename.strip('"'),
-                    "content": part.raw,
-                    "content_type": part.headers.get(b"Content-Type", b"application/octet-stream").decode("utf-8", "replace"),
-                }
-            else:
-                files[name] = part.text
-        return files
-
-    except Exception as e:
-        logger.warning(f"multipart parser failed: {e}")
-        if "boundary=" in (content_type or ""):
-            try:
-                boundary = content_type.split("boundary=", 1)[1].split(";", 1)[0].strip()
-                return parse_multipart_manual(body, boundary)
-            except Exception as e2:
-                logger.error(f"Manual parsing also failed: {e2}")
-        return parse_single_file_fallback(body, content_type)
-
-def parse_multipart_manual(body: bytes, boundary: str) -> Dict[str, Any]:
-    """Manual multipart parsing when library parsing fails."""
-    boundary_bytes = f"--{boundary}".encode("utf-8")
-    parts = body.split(boundary_bytes)
-
-    files: Dict[str, Any] = {}
-    for part in parts[1:-1]:  # Skip first empty and last closing parts
-        if not part.strip():
-            continue
-
-        # Split headers and content
-        if b"\r\n\r\n" in part:
-            headers_section, content = part.split(b"\r\n\r\n", 1)
-        elif b"\n\n" in part:
-            headers_section, content = part.split(b"\n\n", 1)
-        else:
-            continue
-
-        content = content.rstrip(b"\r\n--")
-
-        # Parse headers
-        headers = {}
-        for line in headers_section.decode("utf-8", errors="replace").split("\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                headers[key.strip().lower()] = value.strip()
-
-        # Extract field name and filename
-        content_disposition = headers.get("content-disposition", "")
-        if "name=" in content_disposition:
-            name_match = content_disposition.split("name=", 1)[1].split(";", 1)[0].strip('"')
-
-            if "filename=" in content_disposition:
-                filename_match = content_disposition.split("filename=", 1)[1].split(";", 1)[0].strip('"')
-                files[name_match] = {
-                    "filename": filename_match,
-                    "content": content,
-                    "content_type": headers.get("content-type", "application/octet-stream"),
-                }
-            else:
-                files[name_match] = content.decode("utf-8", errors="replace")
-
-    # Prefer message/rfc822 or *.eml for the primary file key
-    try:
-        best_key = None
-        for k, v in files.items():
-            if isinstance(v, dict) and 'content' in v:
-                ct = str(v.get('content_type', '')).lower()
-                fn = str(v.get('filename', ''))
-                if ct == 'message/rfc822' or fn.lower().endswith('.eml'):
-                    best_key = k
-                    break
-        if best_key and 'file' not in files:
-            files['file'] = files[best_key]
-    except Exception as e:
-        logger.warning(f"Failed to select best multipart file part: {e}")
-
-    return files
-
-def parse_single_file_fallback(body: bytes, content_type: str) -> Dict[str, Any]:
-    """
-    Fallback for single file uploads when boundary is missing.
-    Treat the entire body as the file content.
-    """
-    logger.info("Using single file fallback parser")
-    # If the body looks like multipart but header was missing, try to recover by sniffing boundary
-    try:
-        if (body or b"").lstrip().startswith(b"--") or b"WebKitFormBoundary" in (body or b""):
-            boundary = _extract_boundary(content_type or "", body or b"")
-            if boundary:
-                logger.info("Fallback: detected multipart body, attempting manual parse via sniffed boundary")
-                files = parse_multipart_manual(body, boundary)
-                if isinstance(files, dict) and isinstance(files.get("file"), dict):
-                    return files
-    except Exception as e:
-        logger.warning(f"Fallback multipart sniff failed: {e}")
-
-    filename = "uploaded_file.eml"  # Default filename
-
-    # Heuristic: does body look like EML?
-    try:
-        body_str = body.decode('utf-8', errors='replace')
-        if any(h in body_str[:1000] for h in ['From:', 'To:', 'Subject:', 'Date:']):
-            filename = f"upload_{uuid.uuid4().hex[:8]}.eml"
-    except Exception:
-        pass
-
-    return {
-        "file": {
-            "filename": filename,
-            "content": body,
-            "content_type": content_type if "eml" in (content_type or "") else "message/rfc822",
-        }
-    }
+    return doc_converter.eml_bytes_to_pdf_bytes(eml_bytes)
 
 # =====================
 # Conversion helpers
 # =====================
 
-def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
-    """Convert Outlook .msg bytes into RFC 822 EML bytes."""
-    import tempfile
-    try:
-        import extract_msg
-        logger.info(f"DEBUGGING: convert_msg_bytes_to_eml_bytes starting with {len(msg_bytes)} bytes")
-        
-        # Write to a temporary .msg file because extract_msg expects a path
-        with tempfile.NamedTemporaryFile(suffix='.msg', delete=False) as tmpf:
-            tmp_path = tmpf.name
-            tmpf.write(msg_bytes)
-
-        try:
-            m = extract_msg.Message(tmp_path)
-            logger.info(f"DEBUGGING: extract_msg.Message created successfully")
-            
-            # Log message properties
-            try:
-                subj = getattr(m, 'subject', None) or ''
-                sender = getattr(m, 'sender', None) or getattr(m, 'sender_email', None) or ''
-                logger.info(f"DEBUGGING: Message subject: '{subj}', sender: '{sender}'")
-            except Exception as e:
-                logger.warning(f"DEBUGGING: Error getting basic properties: {e}")
-            
-            # Attempt to obtain a displayable Date value up front
-            date_hdr = None
-            try:
-                date_val = getattr(m, 'date', None)
-                if isinstance(date_val, datetime):
-                    date_hdr = format_datetime(date_val)
-                elif date_val:
-                    date_hdr = str(date_val)
-            except Exception:
-                date_hdr = None
-
-            # Prefer native conversion if available
-            em = None
-            if hasattr(m, 'as_email'):
-                try:
-                    logger.info(f"DEBUGGING: Trying m.as_email() method")
-                    em = m.as_email()
-                    logger.info(f"DEBUGGING: m.as_email() succeeded")
-                except Exception as e:
-                    logger.warning(f"DEBUGGING: m.as_email() failed: {e}")
-                    em = None
-            if em is None and hasattr(m, 'asEmailMessage'):
-                try:
-                    logger.info(f"DEBUGGING: Trying m.asEmailMessage() method")
-                    em = m.asEmailMessage()
-                    logger.info(f"DEBUGGING: m.asEmailMessage() succeeded")
-                except Exception as e:
-                    logger.warning(f"DEBUGGING: m.asEmailMessage() failed: {e}")
-                    em = None
-            if em is None:
-                logger.info(f"DEBUGGING: Using manual EmailMessage construction")
-                # Manual construction
-                em = EmailMessage()
-                # Basic headers
-                subj = getattr(m, 'subject', None) or ''
-                sender = getattr(m, 'sender', None) or getattr(m, 'sender_email', None) or ''
-                to_list = getattr(m, 'to', None) or []
-                cc_list = getattr(m, 'cc', None) or []
-                bcc_list = getattr(m, 'bcc', None) or []
-
-                em['Subject'] = subj
-                if sender:
-                    em['From'] = sender
-                if to_list:
-                    em['To'] = ', '.join(to_list if isinstance(to_list, list) else [str(to_list)])
-                if cc_list:
-                    em['Cc'] = ', '.join(cc_list if isinstance(cc_list, list) else [str(cc_list)])
-                if bcc_list:
-                    em['Bcc'] = ', '.join(bcc_list if isinstance(bcc_list, list) else [str(bcc_list)])
-
-                if date_hdr:
-                    em['Date'] = date_hdr
-
-                # Body: prefer HTML
-                def _decode_to_str(val):
-                    if val is None:
-                        return ''
-                    if isinstance(val, str):
-                        return val
-                    if isinstance(val, (bytes, bytearray)):
-                        for enc in ('utf-8', 'cp1252', 'latin1', 'iso-8859-1'):
-                            try:
-                                return val.decode(enc)
-                            except Exception:
-                                continue
-                        return val.decode('utf-8', errors='replace')
-                    try:
-                        return str(val)
-                    except Exception:
-                        return ''
-
-                # Try multiple methods to extract the complete body content
-                html_body = _decode_to_str(getattr(m, 'htmlBody', None) or getattr(m, 'html', None))
-                text_body = _decode_to_str(getattr(m, 'body', None) or '')
-                
-                logger.info(f"DEBUGGING: Initial body extraction - HTML: {len(html_body)} chars, Text: {len(text_body)} chars")
-                if html_body:
-                    logger.info(f"DEBUGGING: HTML body preview: {html_body[:300]}...")
-                if text_body:
-                    logger.info(f"DEBUGGING: Text body preview: {text_body[:300]}...")
-                
-                # Try to get additional content that might be missing
-                try:
-                    # Check for RTF body that might contain the full content
-                    rtf_body = _decode_to_str(getattr(m, 'rtfBody', None))
-                    if rtf_body and len(rtf_body) > max(len(html_body), len(text_body)):
-                        logger.info(f"DEBUGGING: RTF body is larger ({len(rtf_body)} chars), using as fallback")
-                        text_body = rtf_body
-                    
-                    # Try alternative body properties
-                    for prop_name in ['compressedRtf', 'plainTextBody', 'textBody']:
-                        try:
-                            alt_content = getattr(m, prop_name, None)
-                            if alt_content:
-                                decoded = _decode_to_str(alt_content)
-                                if decoded and len(decoded.strip()) > max(len(text_body), len(html_body)):
-                                    logger.info(f"DEBUGGING: Found better content in {prop_name}: {len(decoded)} chars")
-                                    text_body = decoded
-                                    break
-                        except Exception as alt_e:
-                            logger.info(f"DEBUGGING: Error accessing {prop_name}: {alt_e}")
-                
-                except Exception as alt_extract_e:
-                    logger.warning(f"DEBUGGING: Alternative body extraction failed: {alt_extract_e}")
-
-                # If we still have minimal content, this suggests the .msg contains primarily forwarded content
-                # Try to extract the original sender's content before the forwarded part
-                if (text_body and "---------- Forwarded message ---------" in text_body and
-                    not any(phrase in text_body[:500] for phrase in ["Good afternoon", "good afternoon", "Good morning", "good morning"])):
-                    
-                    logger.info(f"DEBUGGING: Detected forwarded message, trying to find original content")
-                    
-                    # Look for content before the forwarded message marker
-                    parts = text_body.split("---------- Forwarded message ---------", 1)
-                    if len(parts) > 1 and parts[0].strip():
-                        original_content = parts[0].strip()
-                        forwarded_content = "---------- Forwarded message ---------" + parts[1]
-                        
-                        # Combine original + forwarded
-                        combined_content = original_content + "\n\n" + forwarded_content
-                        logger.info(f"DEBUGGING: Found original content before forwarded message: {len(original_content)} chars")
-                        logger.info(f"DEBUGGING: Original content preview: {original_content[:300]}...")
-                        text_body = combined_content
-                    
-                    # Do same for HTML body if present
-                    if html_body and "---------- Forwarded message ---------" in html_body:
-                        parts = html_body.split("---------- Forwarded message ---------", 1)
-                        if len(parts) > 1 and parts[0].strip():
-                            original_html = parts[0].strip()
-                            forwarded_html = "---------- Forwarded message ---------" + parts[1]
-                            html_body = original_html + "<br><br>" + forwarded_html
-                            logger.info(f"DEBUGGING: Combined HTML content: {len(html_body)} chars")
-
-                logger.info(f"DEBUGGING: Final body content - HTML: {len(html_body)} chars, Text: {len(text_body)} chars")
-
-                # Normalize line endings in plain text to avoid CR artifacts
-                if text_body:
-                    text_body = text_body.replace('\r\n', '\n').replace('\r', '\n')
-
-                if html_body:
-                    logger.info(f"DEBUGGING: Setting HTML body as primary content")
-                    # Set plain part too if available
-                    if text_body:
-                        em.set_content(text_body)
-                        em.add_alternative(html_body, subtype='html')
-                    else:
-                        em.add_alternative(html_body, subtype='html')
-                else:
-                    logger.info(f"DEBUGGING: Setting text body as primary content")
-                    em.set_content(text_body)
-
-                # Attachments (best-effort) with inline-image CID wiring for HTML
-                try:
-                    # Collect any cid: tokens from html to map inline images
-                    cids_in_html = set(re.findall(r'cid:([^"\'>\s]+)', html_body, flags=re.IGNORECASE)) if html_body else set()
-                    cids_iter = iter(cids_in_html)
-                    atts = getattr(m, 'attachments', []) or []
-                    for att in atts:
-                        try:
-                            data = getattr(att, 'data', None)
-                            if not data:
-                                # Some versions use .binary
-                                data = getattr(att, 'binary', None)
-                            if data is None:
-                                continue
-                            filename = getattr(att, 'longFilename', None) or getattr(att, 'shortFilename', None) or 'attachment'
-                            mime = getattr(att, 'mimeType', None)
-                            # Infer MIME type from filename when missing or generic
-                            if not mime or str(mime).lower() == 'application/octet-stream':
-                                try:
-                                    import mimetypes
-                                    guessed, _ = mimetypes.guess_type(filename or '')
-                                    if guessed:
-                                        mime = guessed
-                                    else:
-                                        mime = 'application/octet-stream'
-                                except Exception:
-                                    mime = 'application/octet-stream'
-                            maintype, subtype = (str(mime).split('/', 1) + ['octet-stream'])[:2]
-
-                            if maintype.lower() == 'image':
-                                # Try to obtain or synthesize a CID
-                                cid = (
-                                    getattr(att, 'cid', None)
-                                    or getattr(att, 'contentId', None)
-                                    or getattr(att, 'content_id', None)
-                                )
-                                if not cid:
-                                    try:
-                                        # If HTML references CIDs, assign them in order
-                                        cid = next(cids_iter)
-                                    except StopIteration:
-                                        # Fall back to filename-based CID or a generated one
-                                        base = os.path.basename(filename or 'image')
-                                        base = re.sub(r'[^A-Za-z0-9_.-]+', '', base) or 'image'
-                                        cid = f"{base}-{uuid.uuid4().hex[:8]}"
-                                # Add image as attachment and then set headers to hint inline usage
-                                prev_len = len(em.get_payload() or [])
-                                em.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
-                                try:
-                                    new_part = em.get_payload()[-1] if (em.get_payload() and len(em.get_payload()) > prev_len) else None
-                                    if new_part is not None:
-                                        # Content-ID must be in angle brackets
-                                        new_part.add_header('Content-ID', f"<{cid}>")
-                                        # Prefer inline disposition
-                                        try:
-                                            new_part.replace_header('Content-Disposition', f'inline; filename="{filename}"')
-                                        except Exception:
-                                            new_part.add_header('Content-Disposition', f'inline; filename="{filename}"')
-                                        # Propagate Content-Location if present on the MSG attachment
-                                        try:
-                                            cloc = getattr(att, 'contentLocation', None) or getattr(att, 'content_location', None) or getattr(att, 'ContentLocation', None)
-                                            if cloc:
-                                                new_part.add_header('Content-Location', str(cloc))
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-                            else:
-                                # Non-image attachments unchanged
-                                em.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-            else:
-                # Ensure Date header exists when using as_email()
-                if date_hdr and not em.get('Date'):
-                    em['Date'] = date_hdr
-
-            # Harmonize/ensure inline image attachments present even when using as_email()
-            try:
-                def _dec_str(val):
-                    try:
-                        if val is None:
-                            return ''
-                        if isinstance(val, str):
-                            return val
-                        if isinstance(val, (bytes, bytearray)):
-                            for enc in ('utf-8', 'cp1252', 'latin1', 'iso-8859-1'):
-                                try:
-                                    return val.decode(enc)
-                                except Exception:
-                                    continue
-                            return val.decode('utf-8', errors='replace')
-                        return str(val)
-                    except Exception:
-                        return ''
-                html_body_for_cid = ''
-                try:
-                    html_body_for_cid = html_body if 'html_body' in locals() and html_body else _dec_str(getattr(m, 'htmlBody', None) or getattr(m, 'html', None))
-                except Exception:
-                    html_body_for_cid = ''
-                cids_in_html = set(re.findall(r'cid:([^"\'>\s]+)', html_body_for_cid, flags=re.IGNORECASE)) if html_body_for_cid else set()
-                existing_cids = set()
-                existing_filenames = set()
-                try:
-                    for part_exist in (em.walk() if hasattr(em, 'walk') else []):
-                        try:
-                            cidv = part_exist.get('Content-ID')
-                            if cidv:
-                                existing_cids.add(cidv.strip('<>'))
-                            fnv = part_exist.get_filename()
-                            if fnv:
-                                existing_filenames.add(os.path.basename(fnv))
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-                cids_iter = iter([c for c in cids_in_html if c not in existing_cids])
-                atts = getattr(m, 'attachments', []) or []
-                for att in atts:
-                    try:
-                        data = getattr(att, 'data', None) or getattr(att, 'binary', None)
-                        if data is None:
-                            continue
-                        filename = getattr(att, 'longFilename', None) or getattr(att, 'shortFilename', None) or 'attachment'
-                        mime = getattr(att, 'mimeType', None)
-                        # Infer MIME type from filename when missing or generic
-                        if not mime or str(mime).lower() == 'application/octet-stream':
-                            try:
-                                import mimetypes
-                                guessed, _ = mimetypes.guess_type(filename or '')
-                                if guessed:
-                                    mime = guessed
-                                else:
-                                    mime = 'application/octet-stream'
-                            except Exception:
-                                mime = 'application/octet-stream'
-                        maintype, subtype = (str(mime).split('/', 1) + ['octet-stream'])[:2]
-                        # If still not categorized as image, skip
-                        if maintype.lower() != 'image':
-                            continue
-                        cid = getattr(att, 'cid', None) or getattr(att, 'contentId', None) or getattr(att, 'content_id', None)
-                        if not cid:
-                            try:
-                                cid = next(cids_iter)
-                            except StopIteration:
-                                base = os.path.basename(filename or 'image')
-                                base = re.sub(r'[^A-Za-z0-9_.-]+', '', base) or 'image'
-                                cid = f"{base}-{uuid.uuid4().hex[:8]}"
-                        # Avoid duplicates by CID or filename
-                        if cid in existing_cids or os.path.basename(filename or '') in existing_filenames:
-                            continue
-                        prev_len = len(em.get_payload() or [])
-                        em.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
-                        try:
-                            new_part = em.get_payload()[-1] if (em.get_payload() and len(em.get_payload()) > prev_len) else None
-                            if new_part is not None:
-                                new_part.add_header('Content-ID', f"<{cid}>")
-                                try:
-                                    new_part.replace_header('Content-Disposition', f'inline; filename="{filename}"')
-                                except Exception:
-                                    new_part.add_header('Content-Disposition', f'inline; filename="{filename}"')
-                                # Propagate Content-Location if present on the MSG attachment
-                                try:
-                                    cloc = getattr(att, 'contentLocation', None) or getattr(att, 'content_location', None) or getattr(att, 'ContentLocation', None)
-                                    if cloc:
-                                        new_part.add_header('Content-Location', str(cloc))
-                                except Exception:
-                                    pass
-                            existing_cids.add(cid)
-                            if filename:
-                                existing_filenames.add(os.path.basename(filename))
-                        except Exception:
-                            pass
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-            # Serialize to bytes
-            buf = io.BytesIO()
-            BytesGenerator(buf, policy=default).flatten(em)
-            return buf.getvalue()
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f".msg to .eml conversion failed: {e}")
-        raise
-
-# =====================
-# Rich EML extraction helpers (images + emoji support)
 # =====================
 
 def get_part_content(part):
@@ -1790,7 +480,7 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                         if not isinstance(data, (bytes, bytearray)) and hasattr(data, 'as_bytes'):
                             data = data.as_bytes()
                         if data and fname and fname.lower().endswith('.msg'):
-                            data = convert_msg_bytes_to_eml_bytes(data)
+                            data = converter.convert_msg_bytes_to_eml_bytes(data)
                         if data:
                             pdf_data = eml_bytes_to_pdf_bytes(data)
                             if pdf_data:
@@ -2527,6 +1217,8 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         logger.error(f"EML conversion stack trace: {traceback.format_exc()}")
         return False
 
+doc_converter.eml_to_pdf = convert_eml_to_pdf
+
 def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url: str = None) -> bool:
     """Convert HTML to PDF using Playwright (Chromium baked into the image)."""
     max_retries = 3
@@ -2737,6 +1429,8 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
     
     logger.error("Unexpected exit from retry loop")
     return False
+
+doc_converter.html_to_pdf = html_to_pdf_playwright
 
 def fallback_html_to_pdf(html_content: str, output_path: str) -> bool:
     """Fallback PDF generation using FPDF for basic text content."""
@@ -3010,24 +1704,20 @@ def sanitize_filename(name: str, default: str = 'file') -> str:
 def handle_convert(event: Dict[str, Any]) -> Dict[str, Any]:
     """Handle EML to PDF conversion."""
     logger.info("=== HANDLE_CONVERT STARTED ===")
-    
+
     try:
-        logger.info("Getting body bytes from event...")
-        body = _get_body_bytes(event)
-        logger.info(f"Body bytes retrieved: {len(body) if body else 0} bytes")
-        
-        logger.info("Processing headers...")
-        headers = _lower_headers(event.get('headers', {}))
+        parser = RequestParser(event)
+        body = parser.body
+        headers = parser.headers
         content_type = headers.get('content-type', '')
         logger.info(f"Content-Type: {content_type}")
-        logger.info(f"Headers processed: {list(headers.keys())}")
 
-        logger.info(f"=== Starting conversion request processing ===")
+        logger.info("=== Starting conversion request processing ===")
 
         # Parse the multipart/ or single-file body
         logger.info("About to parse multipart data...")
         try:
-            files = parse_multipart_data_strict(body, content_type)
+            files = multipart_parser.parse(body, content_type)
             logger.info(f"Multipart parsing completed. Found keys: {list(files.keys())}")
         except Exception as e:
             logger.error(f"Failed to parse multipart data: {e}")
@@ -3105,7 +1795,7 @@ def handle_convert(event: Dict[str, Any]) -> Dict[str, Any]:
         if ext == '.msg':
             try:
                 logger.info("Detected .msg file - converting to EML bytes and extracting attachments...")
-                eml_source, msg_attachments = convert_msg_bytes_to_eml_bytes_with_attachments(file_content)
+                eml_source, msg_attachments = converter.convert_msg_bytes_to_eml_bytes_with_attachments(file_content)
                 logger.info(f".msg converted to EML: {len(eml_source) if eml_source else 0} bytes")
                 logger.info(f"Extracted {len(msg_attachments)} attachments from .msg file")
             except Exception as e:
@@ -3492,11 +2182,8 @@ def handle_health(event: Dict[str, Any]) -> Dict[str, Any]:
 def handle_upload_url(event: Dict[str, Any]) -> Dict[str, Any]:
     """Return a presigned S3 PUT URL for direct browser upload (bypasses API GW 10MB limit)."""
     try:
-        body_bytes = _get_body_bytes(event)
-        try:
-            data = json.loads((body_bytes or b"").decode("utf-8", "ignore") or "{}")
-        except Exception:
-            data = {}
+        parser = RequestParser(event)
+        data = parser.json()
 
         filename = str(data.get("filename") or "").strip()
         content_type = str(data.get("content_type") or "application/octet-stream")
@@ -3546,11 +2233,9 @@ def handle_upload_url(event: Dict[str, Any]) -> Dict[str, Any]:
 def handle_convert_s3(event: Dict[str, Any]) -> Dict[str, Any]:
     """Convert files that were uploaded directly to S3 (by key) and return batch results."""
     try:
-        body_bytes = _get_body_bytes(event)
-        try:
-            data = json.loads((body_bytes or b"").decode("utf-8", "ignore") or "{}")
-        except Exception as e:
-            logger.error(f"convert-s3 invalid JSON: {e}")
+        parser = RequestParser(event)
+        data = parser.json()
+        if not data:
             data = {}
 
         keys = data.get("keys") or []
@@ -3562,7 +2247,7 @@ def handle_convert_s3(event: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         # Determine or accept provided session_id so all results share one prefix
-        headers = _lower_headers(event.get('headers', {}) or {})
+        headers = parser.headers
         query = event.get('queryStringParameters', {}) or {}
         provided_sid = str((data.get('session_id') or query.get('session_id') or headers.get('x-session-id') or '').strip())
         if provided_sid and re.fullmatch(r'[A-Za-z0-9_\-]{8,100}', provided_sid):
@@ -3588,7 +2273,7 @@ def handle_convert_s3(event: Dict[str, Any]) -> Dict[str, Any]:
                 msg_attachments = []
                 if ext == ".msg":
                     try:
-                        eml_source, msg_attachments = convert_msg_bytes_to_eml_bytes_with_attachments(file_bytes)
+                        eml_source, msg_attachments = converter.convert_msg_bytes_to_eml_bytes_with_attachments(file_bytes)
                         logger.info(f"Extracted {len(msg_attachments)} attachments from {s3_key}")
                     except Exception as e:
                         logger.error(f".msg conversion failed for {s3_key}: {e}")
@@ -3715,7 +2400,8 @@ def handle_auth_check(event: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # Check for password in headers or query parameters
-    headers = _lower_headers(event.get('headers', {}) or {})
+    parser = RequestParser(event)
+    headers = parser.headers
     query_params = event.get('queryStringParameters', {}) or {}
 
     provided_password = (
@@ -3856,90 +2542,21 @@ def handle_twemoji(event: Dict[str, Any]) -> Dict[str, Any]:
             'body': json.dumps({'error': 'Emoji asset unavailable'})
         }
 
+router = LambdaRouter(verify_playwright_installation)
+HANDLERS = {
+    ("POST", "/api/convert"): handle_convert,
+    ("POST", "/api/upload-url"): handle_upload_url,
+    ("POST", "/api/convert-s3"): handle_convert_s3,
+    ("GET", "/api/health"): handle_health,
+    ("GET", "/api/auth/check"): handle_auth_check,
+    "download": handle_download,
+    "download_all": handle_download_all,
+    "twemoji": handle_twemoji,
+}
 def lambda_handler(event, context):
-    """Main Lambda handler."""
-    logger.info("Lambda handler started")
-    
+    """Main Lambda entry point."""
     try:
-        # Log memory usage and environment info
-        import psutil
-        memory_info = psutil.virtual_memory()
-        logger.info(f"Available memory: {memory_info.available / 1024 / 1024:.1f} MB")
-        logger.info(f"PLAYWRIGHT_BROWSERS_PATH env var: {os.environ.get('PLAYWRIGHT_BROWSERS_PATH', 'Not set')}")
-        
-        # Verify Playwright installation on first conversion request only
-        path = event.get('path', '') or ''
-        method = event.get('httpMethod', '') or ''
-        
-        if path == '/api/convert' and method == 'POST':
-            # Check browser installation before processing
-            if not verify_playwright_installation():
-                logger.error("Playwright browser verification failed - using fallback PDF generation")
-        
-        # Add CORS headers
-        cors_headers = {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type, X-App-Password, Authorization',
-            'Access-Control-Allow-Methods': 'OPTIONS, POST, GET'
-        }
-
-        # Handle OPTIONS preflight requests
-        if event.get('httpMethod') == 'OPTIONS':
-            return {
-                'statusCode': 200,
-                'headers': cors_headers,
-                'body': ''
-            }
-
-        logger.info(f"Processing request: {method} {path}")
-
-        # Route to appropriate handler
-        if path == '/api/convert' and method == 'POST':
-            response = handle_convert(event)
-        elif path == '/api/upload-url' and method == 'POST':
-            response = handle_upload_url(event)
-        elif path == '/api/convert-s3' and method == 'POST':
-            response = handle_convert_s3(event)
-        elif path.startswith('/api/download/') and method == 'GET':
-            response = handle_download(event)
-        elif path.startswith('/api/download-all/') and method == 'GET':
-            response = handle_download_all(event)
-        elif path == '/api/health' and method == 'GET':
-            response = handle_health(event)
-        elif path == '/api/auth/check' and method == 'GET':
-            response = handle_auth_check(event)
-        elif path.startswith('/api/twemoji/') and method == 'GET':
-            response = handle_twemoji(event)
-        else:
-            response = {
-                'statusCode': 404,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({'error': 'Not found'})
-            }
-
-        # Add CORS headers to response
-        if 'headers' not in response:
-            response['headers'] = {}
-        response['headers'].update(cors_headers)
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Lambda handler error: {str(e)}")
-        cors_headers = {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type, X-App-Password, Authorization',
-            'Access-Control-Allow-Methods': 'OPTIONS, POST, GET'
-        }
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                **cors_headers
-            },
-            'body': json.dumps({'error': f'Internal server error: {str(e)}'})
-        }
+        return router.handle(event, HANDLERS)
     finally:
-        # Always clean up browser resources at the end
         cleanup_browser_processes()
         logger.info("Lambda handler completed")
