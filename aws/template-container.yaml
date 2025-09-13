@@ -41,6 +41,10 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub 'eml-converter-temp-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
       LifecycleConfiguration:
@@ -64,6 +68,10 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub 'eml-converter-frontend-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       WebsiteConfiguration:
         IndexDocument: index.html
         ErrorDocument: index.html
