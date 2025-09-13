@@ -146,12 +146,9 @@ def test_backend_conversion(msg_path: str):
     
     try:
         # Import our backend functions
-        from lambda_function import (
-            extract_msg_attachments_with_embedded,
-            convert_msg_bytes_to_eml_bytes_with_attachments,
-            convert_msg_bytes_to_eml_bytes,
-            eml_bytes_to_pdf_bytes
-        )
+        from converter import EmailConverter
+        from lambda_function import eml_bytes_to_pdf_bytes
+        converter = EmailConverter()
         
         # Read the .msg file
         with open(msg_path, 'rb') as f:
@@ -162,7 +159,7 @@ def test_backend_conversion(msg_path: str):
         # Test 1: Basic .msg to EML conversion
         print("\n🔄 Test 1: Basic .msg to EML conversion...")
         try:
-            eml_bytes = convert_msg_bytes_to_eml_bytes(msg_bytes)
+            eml_bytes = converter.convert_msg_bytes_to_eml_bytes(msg_bytes)
             if eml_bytes:
                 print(f"✅ Successfully converted to EML ({len(eml_bytes)} bytes)")
             else:
@@ -174,7 +171,7 @@ def test_backend_conversion(msg_path: str):
         # Test 2: .msg to EML with attachment extraction
         print("\n🔄 Test 2: .msg to EML with attachment extraction...")
         try:
-            eml_bytes, attachments = convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes)
+            eml_bytes, attachments = converter.convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes)
             if eml_bytes:
                 print(f"✅ Successfully converted to EML ({len(eml_bytes)} bytes)")
                 print(f"📎 Extracted {len(attachments)} attachments:")
@@ -189,7 +186,7 @@ def test_backend_conversion(msg_path: str):
                     if att.get('content_type') == 'application/vnd.ms-outlook' or att.get('filename', '').lower().endswith('.msg'):
                         print(f"    🔄 Testing nested .msg to PDF conversion...")
                         try:
-                            nested_eml = convert_msg_bytes_to_eml_bytes(att.get('data', b''))
+                            nested_eml = converter.convert_msg_bytes_to_eml_bytes(att.get('data', b''))
                             if nested_eml:
                                 nested_pdf = eml_bytes_to_pdf_bytes(nested_eml)
                                 if nested_pdf:
