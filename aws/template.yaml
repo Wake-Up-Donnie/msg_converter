@@ -75,7 +75,7 @@ Resources:
         Rules:
           - Id: ExpireOldBuilds
             Status: Enabled
-            ExpirationInDays: 30
+            ExpirationInDays: 2
       WebsiteConfiguration:
         IndexDocument: index.html
         ErrorDocument: index.html
