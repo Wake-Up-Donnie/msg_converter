@@ -71,6 +71,11 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldBuilds
+            Status: Enabled
+            ExpirationInDays: 30
       WebsiteConfiguration:
         IndexDocument: index.html
         ErrorDocument: index.html
