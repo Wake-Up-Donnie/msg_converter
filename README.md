@@ -171,6 +171,14 @@ If `APP_PASSWORD` is set in the environment:
 - The password is stored in browser localStorage for convenience
 - Downloads include the password as a query parameter automatically
 
+### Environment Variables
+
+| Variable | Description |
+| --- | --- |
+| `APP_PASSWORD` | Optional password gate for all endpoints. |
+| `AUTH_MODE` | Set to `subscription` to enable JWT-based registration and login. |
+| `SECRET_KEY` | Key used to sign JWTs when `AUTH_MODE=subscription`. |
+
 ## Project Structure
 
 ```
