@@ -2,6 +2,7 @@ import os
 import tempfile
 import io
 import logging
+import mimetypes
 from email.message import EmailMessage
 from email.generator import BytesGenerator
 from email.policy import default
@@ -212,11 +213,44 @@ class EmailConverter:
                                         f"DEBUGGING: Investigating unknown attachment - name: '{att_name}', has_data: {hasattr(attachment, 'data')}"
                                     )
                                 att_name_safe = att_name or 'embedded_message'
-                                if hasattr(attachment, 'data') and attachment.data:
+                                binary_name = att_name or f"attachment-{len(attachments)+1}"
+                                raw_data = None
+                                if hasattr(attachment, 'data'):
+                                    try:
+                                        raw_data = attachment.data
+                                    except Exception as data_e:
+                                        raw_data = None
+                                        if self.logger:
+                                            self.logger.warning(
+                                                f"DEBUGGING: Could not access attachment data for {att_name_safe}: {data_e}"
+                                            )
+                                if isinstance(raw_data, (bytes, bytearray)) and raw_data:
+                                    content_type = (
+                                        getattr(attachment, 'mimeType', None)
+                                        or getattr(attachment, 'mimetype', None)
+                                    )
+                                    if not content_type and att_name_safe:
+                                        guessed, _ = mimetypes.guess_type(att_name_safe)
+                                        content_type = guessed
+                                    if not content_type:
+                                        content_type = 'application/octet-stream'
+                                    attachments.append(
+                                        {
+                                            'filename': binary_name,
+                                            'content_type': content_type,
+                                            'data': bytes(raw_data),
+                                        }
+                                    )
+                                    if self.logger:
+                                        self.logger.info(
+                                            f"DEBUGGING: Extracted binary attachment with inferred type: {att_name_safe} ({content_type}, {len(raw_data)} bytes)"
+                                        )
+                                    continue
+                                if raw_data:
                                     if (
                                         att_name_safe.lower().endswith('.msg')
-                                        or hasattr(attachment.data, 'save')
-                                        or hasattr(attachment.data, 'subject')
+                                        or hasattr(raw_data, 'save')
+                                        or hasattr(raw_data, 'subject')
                                         or str(getattr(attachment, 'type', '')) == '1'
                                     ):
                                         if self.logger:
@@ -224,7 +258,7 @@ class EmailConverter:
                                                 f"DEBUGGING: Treating unknown attachment as embedded message: {att_name_safe}"
                                             )
                                         try:
-                                            embedded_data = attachment.data
+                                            embedded_data = raw_data
                                             if hasattr(embedded_data, 'as_email') or hasattr(
                                                 embedded_data, 'asEmailMessage'
                                             ):
