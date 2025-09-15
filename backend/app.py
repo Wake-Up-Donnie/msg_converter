@@ -48,6 +48,17 @@ if APP_PASSWORD:
 else:
     logger.info("Password protection: DISABLED (APP_PASSWORD not set)")
 
+# Subscription authentication mode
+AUTH_MODE = os.environ.get('AUTH_MODE', 'none')
+if AUTH_MODE == 'subscription':
+    try:
+        from .models import init_db, seed_unlimited_user
+    except ImportError:
+        from models import init_db, seed_unlimited_user
+    init_db()
+    seed_unlimited_user()
+    logger.info("Subscription mode enabled; database initialized")
+
 # Create a persistent storage directory for converted files
 STORAGE_DIR = os.path.join(os.getcwd(), 'converted_files')
 if not os.path.exists(STORAGE_DIR):
