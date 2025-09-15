@@ -10,6 +10,7 @@ ENVIRONMENT="dev"
 REGION="us-east-1"
 PASSWORD=""
 INLINE_REMOTE_IMAGES="false"
+PROFILE=""
 
 # Parse command line arguments
 while [ "$#" -gt 0 ]; do
@@ -30,12 +31,21 @@ while [ "$#" -gt 0 ]; do
       INLINE_REMOTE_IMAGES="$2"
       shift 2
       ;;
+    --profile)
+      PROFILE="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown parameter: $1"
       exit 1
       ;;
   esac
 done
+
+if [ -n "${PROFILE}" ]; then
+  export AWS_PROFILE="${PROFILE}"
+  echo "Using AWS profile: ${AWS_PROFILE}"
+fi
 
 echo "Deploying container-based solution for environment: $ENVIRONMENT"
 echo "AWS Region: $REGION"
