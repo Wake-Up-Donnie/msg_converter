@@ -86,6 +86,9 @@ const API_BASE_URL = (() => {
   return 'http://localhost:5002';
 })();
 
+const AUTH_MODE = process.env.REACT_APP_AUTH_MODE || 'password';
+const isSubscription = AUTH_MODE === 'subscription';
+
 function App() {
   // Guard: Some browser extensions inject scripts that redefine window.ethereum, causing console errors.
   // We can't control them, but we can define a non-configurable noop property when missing to reduce noise.
@@ -103,10 +106,21 @@ function App() {
   const [sessionId, setSessionId] = useState(null);
   const [password, setPassword] = useState('');
   const [authOk, setAuthOk] = useState(false);
-  const [requiresAuth, setRequiresAuth] = useState(false);
+  const [requiresAuth, setRequiresAuth] = useState(isSubscription);
   const [isCheckingAuth, setIsCheckingAuth] = useState(false);
+  const [token, setToken] = useState('');
+  const [email, setEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
 
   useEffect(() => {
+    if (isSubscription) {
+      const savedToken = window.localStorage.getItem('jwt') || '';
+      if (savedToken) {
+        setToken(savedToken);
+        setAuthOk(true);
+      }
+      return;
+    }
     const saved = window.localStorage.getItem('appPassword') || '';
     if (saved) {
       setPassword(saved);
@@ -117,6 +131,33 @@ function App() {
       checkAuthRequirement();
     }
   }, []);
+
+  const getAuthHeaders = useCallback(() => {
+    if (isSubscription) {
+      return token ? { Authorization: `Bearer ${token}` } : {};
+    }
+    return password ? { 'X-App-Password': password, Authorization: `Bearer ${password}` } : {};
+  }, [token, password]);
+
+  const handleLogin = async () => {
+    try {
+      const res = await axios.post(`${API_BASE_URL}/auth/login`, { email, password: loginPassword });
+      const t = res?.data?.token;
+      if (t) {
+        setToken(t);
+        setAuthOk(true);
+        window.localStorage.setItem('jwt', t);
+      }
+    } catch (err) {
+      alert('Login failed');
+    }
+  };
+
+  const handleLogout = () => {
+    setToken('');
+    setAuthOk(false);
+    window.localStorage.removeItem('jwt');
+  };
 
   // Check if authentication is required without attempting to authenticate
   const checkAuthRequirement = useCallback(async () => {
@@ -264,7 +305,7 @@ function App() {
   const convertFiles = async () => {
     if (files.length === 0) return;
     if (requiresAuth && !authOk) {
-      alert('Please unlock with the password before converting.');
+      alert(isSubscription ? 'Please log in before converting.' : 'Please unlock with the password before converting.');
       return;
     }
 
@@ -280,21 +321,16 @@ function App() {
     try {
       // 1) Upload ALL files directly to S3 using pre-signed PUT URLs
       setProgress(10);
-      const keys = await uploadFilesViaS3(files, password);
+      const keys = await uploadFilesViaS3(files);
       // Basic progress bump after uploads complete
       setProgress(70);
 
       // 2) Request server-side conversion for each uploaded key individually
-      let s3Url = `${API_BASE_URL}/convert-s3`;
-      let s3Headers = {};
-      if (isCloudFrontUrl) {
-        s3Url = `${API_BASE_URL}/api/convert-s3${password ? `?auth=${encodeURIComponent(password)}` : ''}`;
-        if (password) {
-          s3Headers = { 'X-App-Password': password, 'Authorization': `Bearer ${password}` };
-        }
-      } else if (password) {
-        s3Headers = { 'X-App-Password': password, 'Authorization': `Bearer ${password}` };
+      let s3Url = isCloudFrontUrl ? `${API_BASE_URL}/api/convert-s3` : `${API_BASE_URL}/convert-s3`;
+      if (!isSubscription && password && isCloudFrontUrl) {
+        s3Url = `${API_BASE_URL}/api/convert-s3?auth=${encodeURIComponent(password)}`;
       }
+      const s3Headers = getAuthHeaders();
 
       const aggregated = [];
       let finalSessionId = null;
@@ -357,24 +393,18 @@ function App() {
   };
 
   // Request a pre-signed URL for each file and upload directly to S3
-  const uploadFilesViaS3 = async (filesToUpload, pwd) => {
+  const uploadFilesViaS3 = async (filesToUpload) => {
     const uploadedKeys = [];
     for (const f of filesToUpload) {
       // 1) Ask backend for a pre-signed URL
-      let presignUrl = `${API_BASE_URL}/upload-url`;
-      let presignHeaders = {};
-      if (isCloudFrontUrl) {
-        presignUrl = `${API_BASE_URL}/api/upload-url${pwd ? `?auth=${encodeURIComponent(pwd)}` : ''}`;
-        if (pwd) {
-          presignHeaders = { 'X-App-Password': pwd, 'Authorization': `Bearer ${pwd}` };
-        }
-      } else if (pwd) {
-        presignHeaders = { 'X-App-Password': pwd, 'Authorization': `Bearer ${pwd}` };
+      let presignUrl = isCloudFrontUrl ? `${API_BASE_URL}/api/upload-url` : `${API_BASE_URL}/upload-url`;
+      if (!isSubscription && password && isCloudFrontUrl) {
+        presignUrl = `${API_BASE_URL}/api/upload-url?auth=${encodeURIComponent(password)}`;
       }
       const presign = await axios.post(presignUrl, {
         filename: f.name,
         content_type: f.type || 'application/octet-stream'
-      }, { headers: presignHeaders });
+      }, { headers: getAuthHeaders() });
 
       const { url, key } = presign.data || {};
       if (!url || !key) throw new Error('Failed to obtain upload URL');
@@ -386,39 +416,45 @@ function App() {
     return uploadedKeys;
   };
 
-  const downloadFile = (sessionId, pdfFilename, originalFilename) => {
-    const link = document.createElement('a');
-    // Ensure we use the correct URL format and path
+  const downloadFile = async (sessionId, pdfFilename, originalFilename) => {
     const encodedName = encodeURIComponent(pdfFilename).replace(/%2F/g, '/');
-    let urlPath = isCloudFrontUrl 
+    const urlPath = isCloudFrontUrl
       ? `${API_BASE_URL}/api/download/${sessionId}/${encodedName}`
       : `${API_BASE_URL}/download/${sessionId}/${encodedName}`;
-    
-    const url = new URL(urlPath);
-    if (password) url.searchParams.set('auth', password);
-    link.href = url.toString();
-    const suggestedName = (pdfFilename || originalFilename).replace(/\.(eml|msg)$/i, '') + '.pdf';
-    link.download = suggestedName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
-  const downloadAllFiles = () => {
-    if (sessionId) {
+    try {
+      const res = await axios.get(urlPath, { headers: getAuthHeaders(), responseType: 'blob' });
+      const blobUrl = window.URL.createObjectURL(new Blob([res.data]));
       const link = document.createElement('a');
-      // Ensure we use the correct URL format and path
-      let urlPath = isCloudFrontUrl 
-        ? `${API_BASE_URL}/api/download-all/${sessionId}`
-        : `${API_BASE_URL}/download-all/${sessionId}`;
-      
-      const url = new URL(urlPath);
-      if (password) url.searchParams.set('auth', password);
-      link.href = url.toString();
-      link.download = `converted_pdfs_${sessionId}.zip`;
+      link.href = blobUrl;
+      const suggestedName = (pdfFilename || originalFilename).replace(/\.(eml|msg)$/i, '') + '.pdf';
+      link.download = suggestedName;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      alert('Download failed');
+    }
+  };
+
+  const downloadAllFiles = async () => {
+    if (sessionId) {
+      const urlPath = isCloudFrontUrl
+        ? `${API_BASE_URL}/api/download-all/${sessionId}`
+        : `${API_BASE_URL}/download-all/${sessionId}`;
+      try {
+        const res = await axios.get(urlPath, { headers: getAuthHeaders(), responseType: 'blob' });
+        const blobUrl = window.URL.createObjectURL(new Blob([res.data]));
+        const link = document.createElement('a');
+        link.href = blobUrl;
+        link.download = `converted_pdfs_${sessionId}.zip`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(blobUrl);
+      } catch (err) {
+        alert('Download failed');
+      }
     }
   };
 
@@ -448,6 +484,32 @@ function App() {
   // Count successful and failed conversions for UI
   const successfulConversions = results.filter(r => r.status === 'success').length;
   const failedConversions = results.length > 0 ? results.length - successfulConversions : 0;
+  if (isSubscription && !authOk) {
+    return (
+      <Container maxWidth="sm" sx={{ py: 4 }}>
+        <Paper elevation={3} sx={{ p: 4 }}>
+          <Typography variant="h5" gutterBottom>Login</Typography>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <input
+              type="email"
+              placeholder="Email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              style={{ padding: '10px', borderRadius: 6, border: '1px solid #ccc' }}
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              style={{ padding: '10px', borderRadius: 6, border: '1px solid #ccc' }}
+            />
+            <Button variant="contained" onClick={handleLogin}>Login</Button>
+          </Box>
+        </Paper>
+      </Container>
+    );
+  }
 
   return (
     <Container maxWidth="md" sx={{ py: 4 }}>
@@ -463,43 +525,50 @@ function App() {
         </Box>
 
         {/* Password Gate */}
-        <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 3 }}>
-          <input
-            type="password"
-            placeholder="Enter access password"
-            value={password}
-            onChange={(e) => {
-              setPassword(e.target.value);
-              // Removed localStorage update here - will happen on successful auth
-            }}
-            style={{ flex: 1, padding: '10px', borderRadius: 6, border: '1px solid #ccc' }}
-            // Add onKeyPress to support Enter key
-            onKeyPress={(e) => {
-              if (e.key === 'Enter') {
-                handleUnlock();
-              }
-            }}
-          />
-          <Button
-            variant="contained"
-            onClick={handleUnlock}
-            disabled={isCheckingAuth}
-          >
-            {isCheckingAuth ? 'Checking...' : 'Unlock'}
-          </Button>
-          <Button
-            variant="outlined"
-            onClick={() => window.localStorage.removeItem('appPassword')}
-          >
-            Clear
-          </Button>
-          {!authOk && (
-            <Chip label="Locked" color="warning" size="small" />
-          )}
-          {authOk && (
-            <Chip label="Unlocked" color="success" size="small" />
-          )}
-        </Box>
+        {!isSubscription && (
+          <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 3 }}>
+            <input
+              type="password"
+              placeholder="Enter access password"
+              value={password}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                // Removed localStorage update here - will happen on successful auth
+              }}
+              style={{ flex: 1, padding: '10px', borderRadius: 6, border: '1px solid #ccc' }}
+              // Add onKeyPress to support Enter key
+              onKeyPress={(e) => {
+                if (e.key === 'Enter') {
+                  handleUnlock();
+                }
+              }}
+            />
+            <Button
+              variant="contained"
+              onClick={handleUnlock}
+              disabled={isCheckingAuth}
+            >
+              {isCheckingAuth ? 'Checking...' : 'Unlock'}
+            </Button>
+            <Button
+              variant="outlined"
+              onClick={() => window.localStorage.removeItem('appPassword')}
+            >
+              Clear
+            </Button>
+            {!authOk && (
+              <Chip label="Locked" color="warning" size="small" />
+            )}
+            {authOk && (
+              <Chip label="Unlocked" color="success" size="small" />
+            )}
+          </Box>
+        )}
+        {isSubscription && authOk && (
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 3 }}>
+            <Button variant="outlined" onClick={handleLogout}>Logout</Button>
+          </Box>
+        )}
 
         {/* File Drop Zone */}
         <Box
