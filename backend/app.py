@@ -3,7 +3,7 @@ import tempfile
 import uuid
 import base64
 import io
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, g
 from flask_cors import CORS
 import email
 from email.parser import Parser
@@ -12,7 +12,8 @@ from email.generator import BytesGenerator
 from playwright.sync_api import sync_playwright
 from pypdf import PdfReader, PdfWriter
 import boto3
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
 import logging
 import html
 import re
@@ -21,6 +22,8 @@ import shutil
 import urllib.request
 import urllib.error
 import subprocess
+import jwt
+from werkzeug.security import generate_password_hash, check_password_hash
 
 
 app = Flask(__name__)
@@ -50,11 +53,26 @@ else:
 
 # Subscription authentication mode
 AUTH_MODE = os.environ.get('AUTH_MODE', 'none')
+SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key')
 if AUTH_MODE == 'subscription':
     try:
-        from .models import init_db, seed_unlimited_user
+        from .models import (
+            init_db,
+            seed_unlimited_user,
+            create_user,
+            get_user_by_email,
+            get_user_by_id,
+        )
     except ImportError:
-        from models import init_db, seed_unlimited_user
+        from models import (
+            init_db,
+            seed_unlimited_user,
+            create_user,
+            get_user_by_email,
+            get_user_by_id,
+        )
+    if SECRET_KEY == 'dev-secret-key':
+        logger.warning("SECRET_KEY not set; using insecure default")
     init_db()
     seed_unlimited_user()
     logger.info("Subscription mode enabled; database initialized")
@@ -67,6 +85,30 @@ if not os.path.exists(STORAGE_DIR):
 # Cache directory for Twemoji SVGs (downloaded on-demand)
 TWEMOJI_CACHE_DIR = os.path.join(STORAGE_DIR, 'twemoji_cache')
 os.makedirs(TWEMOJI_CACHE_DIR, exist_ok=True)
+
+# -------- Auth helpers --------
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if AUTH_MODE != 'subscription':
+            return f(*args, **kwargs)
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Unauthorized'}), 401
+        token = auth_header.split(' ', 1)[1]
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+            user_id = payload.get('user_id')
+            user = get_user_by_id(user_id)
+            if not user:
+                raise jwt.InvalidTokenError
+            g.current_user = user
+        except Exception:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+
+    return wrapper
 
 # -------- Filename helpers --------
 def sanitize_filename(name: str, default: str = 'file') -> str:
@@ -1444,7 +1486,7 @@ def require_password():
     try:
         # Allow health checks and Twemoji assets without password
         path = request.path or ''
-        if path.startswith('/health') or path.startswith('/twemoji'):
+        if path.startswith('/health') or path.startswith('/twemoji') or (AUTH_MODE == 'subscription' and path.startswith('/auth')):
             return None
         # Preflight requests
         if request.method == 'OPTIONS':
@@ -1460,6 +1502,41 @@ def require_password():
     except Exception as e:
         logger.warning(f"Password check error: {e}")
         return jsonify({'error': 'Unauthorized'}), 401
+
+
+if AUTH_MODE == 'subscription':
+    @app.route('/auth/register', methods=['POST'])
+    def auth_register():
+        data = request.json or {}
+        email = data.get('email')
+        password = data.get('password')
+        if not email or not password:
+            return jsonify({'error': 'Email and password required'}), 400
+        if get_user_by_email(email):
+            return jsonify({'error': 'User already exists'}), 400
+        user = create_user(email, generate_password_hash(password))
+        token = jwt.encode(
+            {'user_id': user.id, 'exp': datetime.utcnow() + timedelta(days=7)},
+            SECRET_KEY,
+            algorithm='HS256',
+        )
+        return jsonify({'token': token})
+
+
+    @app.route('/auth/login', methods=['POST'])
+    def auth_login():
+        data = request.json or {}
+        email = data.get('email')
+        password = data.get('password')
+        user = get_user_by_email(email or '')
+        if not user or not check_password_hash(user.password_hash, password or ''):
+            return jsonify({'error': 'Invalid credentials'}), 401
+        token = jwt.encode(
+            {'user_id': user.id, 'exp': datetime.utcnow() + timedelta(days=7)},
+            SECRET_KEY,
+            algorithm='HS256',
+        )
+        return jsonify({'token': token})
 
 @app.route('/auth/check', methods=['POST'])
 @app.route('/api/auth/check', methods=['POST'])
@@ -1507,6 +1584,7 @@ def twemoji_proxy(filename):
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/convert', methods=['POST'])
+@require_auth
 def convert_files():
     """Convert uploaded .eml files to PDF"""
     try:
@@ -1631,6 +1709,7 @@ def convert_files():
 
 @app.route('/download/<session_id>/<filename>', methods=['GET'])
 @app.route('/api/download/<session_id>/<filename>', methods=['GET'])
+@require_auth
 def download_file(session_id, filename):
     """Download converted PDF file"""
     try:
@@ -1647,6 +1726,7 @@ def download_file(session_id, filename):
 
 @app.route('/download-all/<session_id>', methods=['GET'])
 @app.route('/api/download-all/<session_id>', methods=['GET'])
+@require_auth
 def download_all_files(session_id):
     """Download all converted PDF files as a ZIP"""
     try:
