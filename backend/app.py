@@ -139,29 +139,33 @@ class EMLToPDFConverter:
         out_dir = None
         pdf_path = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as src:
-                src.write(data)
-                src.flush()
-                src_path = src.name
-            out_dir = tempfile.mkdtemp()
-            cmd = [
-                'libreoffice',
-                '--headless',
-                '--convert-to',
-                'pdf',
-                src_path,
-                '--outdir',
-                out_dir,
-            ]
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            pdf_path = os.path.join(
-                out_dir, os.path.splitext(os.path.basename(src_path))[0] + '.pdf'
-            )
-            with open(pdf_path, 'rb') as f:
-                return f.read()
-        except Exception as e:
-            logger.warning(f"DOC/DOCX conversion failed: {e}")
-            # Fallbacks for environments without LibreOffice
+            try:
+                if shutil.which('libreoffice'):
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as src:
+                        src.write(data)
+                        src.flush()
+                        src_path = src.name
+                    out_dir = tempfile.mkdtemp()
+                    cmd = [
+                        'libreoffice',
+                        '--headless',
+                        '--convert-to',
+                        'pdf',
+                        src_path,
+                        '--outdir',
+                        out_dir,
+                    ]
+                    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    pdf_path = os.path.join(
+                        out_dir, os.path.splitext(os.path.basename(src_path))[0] + '.pdf'
+                    )
+                    with open(pdf_path, 'rb') as f:
+                        return f.read()
+                else:
+                    logger.info("libreoffice not found - using pypandoc fallback")
+            except Exception as e:
+                logger.warning(f"DOC/DOCX conversion failed: {e}")
+
             try:
                 html_content = None
                 lower_ext = ext.lower()
