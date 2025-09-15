@@ -33,7 +33,7 @@ Conditions:
 Globals:
   Function:
     Timeout: 900  # 15 minutes for large files and PDF merging
-    MemorySize: 3008  # Increased memory for PDF processing
+    MemorySize: 4096  # Increased memory for PDF processing
     EphemeralStorage:
       Size: 2048  # 2 GB temporary storage
 
@@ -154,36 +154,34 @@ Resources:
       MessageRetentionPeriod: 1209600  # 14 days
 
   # ECR Repository for Lambda container
-  ECRRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub 'eml-converter-${Environment}'
-      LifecyclePolicy:
-        LifecyclePolicyText: |
-          {
-            "rules": [
-              {
-                "rulePriority": 1,
-                "description": "Keep only the latest 5 images",
-                "selection": {
-                  "tagStatus": "any",
-                  "countType": "imageCountMoreThan",
-                  "countNumber": 5
-                },
-                "action": {
-                  "type": "expire"
-                }
-              }
-            ]
-          }
-
-  # Lambda function for EML to PDF conversion
+#   ECRRepository:
+#     Type: AWS::ECR::Repository
+#     Properties:
+#       RepositoryName: !Sub 'eml-converter-${Environment}'
+#       LifecyclePolicy:
+#         LifecyclePolicyText: |
+#           {
+#             "rules": [
+#               {
+#                 "rulePriority": 1,
+#                 "description": "Keep only the latest 5 images",
+#                 "selection": {
+#                   "tagStatus": "any",
+#                   "countType": "imageCountMoreThan",
+#                   "countNumber": 5
+#                 },
+#                 "action": {
+#                   "type": "expire"
+#                 }
+#               }
+#             ]
+#           }
+# 
+#   # Lambda function for EML to PDF conversion
   EMLConverterFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub 'eml-converter-${Environment}'
       PackageType: Image
-      ImageUri: 395096735234.dkr.ecr.us-east-1.amazonaws.com/eml-converter-prod:latest
       Environment:
         Variables:
           S3_BUCKET: !Ref TempFilesBucket
