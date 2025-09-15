@@ -90,3 +90,15 @@ Check CloudWatch logs for:
 - "Successfully converted embedded text to PDF" - confirms conversion success
 
 If you don't see these messages, the deployment may not have taken effect.
+
+## 💾 Optional: Increase Lambda Ephemeral Storage
+
+For workflows that handle large attachments, consider allocating more than the default 512 MB of temporary storage:
+
+```bash
+aws lambda update-function-configuration \
+  --function-name YOUR_LAMBDA_FUNCTION_NAME \
+  --ephemeral-storage '{"Size": 1024}'
+```
+
+The example above provisions 1 GB of `/tmp` space for the function.
