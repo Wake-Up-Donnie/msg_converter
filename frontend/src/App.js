@@ -186,8 +186,7 @@ function App() {
         // Local development: use auth/check with headers
         console.log('🖥️ Using local development authentication');
         const headers = { 
-          'X-App-Password': passwordToAuthenticate, 
-          'Authorization': `Bearer ${passwordToAuthenticate}` 
+          'Authorization': `Bearer ${passwordToAuthenticate}`
         };
         
         try {
@@ -290,10 +289,10 @@ function App() {
       if (isCloudFrontUrl) {
         s3Url = `${API_BASE_URL}/api/convert-s3${password ? `?auth=${encodeURIComponent(password)}` : ''}`;
         if (password) {
-          s3Headers = { 'X-App-Password': password, 'Authorization': `Bearer ${password}` };
+          s3Headers = { 'Authorization': `Bearer ${password}` };
         }
       } else if (password) {
-        s3Headers = { 'X-App-Password': password, 'Authorization': `Bearer ${password}` };
+        s3Headers = { 'Authorization': `Bearer ${password}` };
       }
 
       const aggregated = [];
@@ -366,10 +365,10 @@ function App() {
       if (isCloudFrontUrl) {
         presignUrl = `${API_BASE_URL}/api/upload-url${pwd ? `?auth=${encodeURIComponent(pwd)}` : ''}`;
         if (pwd) {
-          presignHeaders = { 'X-App-Password': pwd, 'Authorization': `Bearer ${pwd}` };
+          presignHeaders = { 'Authorization': `Bearer ${pwd}` };
         }
       } else if (pwd) {
-        presignHeaders = { 'X-App-Password': pwd, 'Authorization': `Bearer ${pwd}` };
+        presignHeaders = { 'Authorization': `Bearer ${pwd}` };
       }
       const presign = await axios.post(presignUrl, {
         filename: f.name,

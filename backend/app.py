@@ -5,6 +5,9 @@ import base64
 import io
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+import jwt
 import email
 from email.parser import Parser
 from email.policy import default
@@ -12,7 +15,7 @@ from email.generator import BytesGenerator
 from playwright.sync_api import sync_playwright
 from pypdf import PdfReader, PdfWriter
 import boto3
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import html
 import re
@@ -21,6 +24,7 @@ import shutil
 import urllib.request
 import urllib.error
 import subprocess
+from models import SessionLocal, User, init_db
 
 
 app = Flask(__name__)
@@ -30,7 +34,7 @@ CORS(
     resources={r"/*": {"origins": "*"}},
     supports_credentials=False,
     expose_headers=["Content-Disposition"],
-    allow_headers=["Content-Type", "X-App-Password"]
+    allow_headers=["Content-Type", "Authorization"]
 )
 
 # Configure logging
@@ -41,12 +45,43 @@ logger = logging.getLogger(__name__)
 S3_BUCKET = os.environ.get('S3_BUCKET', 'msg-converter-temp')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 
-# Simple password protection
-APP_PASSWORD = os.environ.get('APP_PASSWORD')  # if set, all API routes (except health and twemoji) require it
-if APP_PASSWORD:
-    logger.info("Password protection: ENABLED (APP_PASSWORD is set)")
-else:
-    logger.info("Password protection: DISABLED (APP_PASSWORD not set)")
+JWT_SECRET = os.environ.get('JWT_SECRET', 'dev-secret')
+
+init_db()
+
+def seed_unlimited_user():
+    session = SessionLocal()
+    if not session.query(User).filter_by(is_unlimited=True).first():
+        user = User(
+            email='unlimited@example.com',
+            password_hash=generate_password_hash('unlimited'),
+            subscription_status='unlimited',
+            is_unlimited=True
+        )
+        session.add(user)
+        session.commit()
+    session.close()
+
+seed_unlimited_user()
+
+def generate_token(user):
+    payload = {'user_id': user.id, 'exp': datetime.utcnow() + timedelta(days=1)}
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
+def require_auth(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Unauthorized'}), 401
+        token = auth_header.split(' ', 1)[1]
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            request.user_id = payload.get('user_id')
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return func(*args, **kwargs)
+    return wrapper
 
 # Create a persistent storage directory for converted files
 STORAGE_DIR = os.path.join(os.getcwd(), 'converted_files')
@@ -1428,38 +1463,37 @@ class EMLToPDFConverter:
 # Initialize converter
 converter = EMLToPDFConverter()
 
-@app.before_request
-def require_password():
-    try:
-        # Allow health checks and Twemoji assets without password
-        path = request.path or ''
-        if path.startswith('/health') or path.startswith('/twemoji'):
-            return None
-        # Preflight requests
-        if request.method == 'OPTIONS':
-            return None
-        # If no password configured, allow all
-        if not APP_PASSWORD:
-            return None
-        # Check header or query param
-        provided = request.headers.get('X-App-Password') or request.args.get('auth')
-        if provided != APP_PASSWORD:
-            return jsonify({'error': 'Unauthorized'}), 401
-        return None
-    except Exception as e:
-        logger.warning(f"Password check error: {e}")
-        return jsonify({'error': 'Unauthorized'}), 401
+@app.route('/auth/register', methods=['POST'])
+def register():
+    data = request.json or {}
+    email = data.get('email')
+    password = data.get('password')
+    if not email or not password:
+        return jsonify({'error': 'Email and password required'}), 400
+    session = SessionLocal()
+    if session.query(User).filter_by(email=email).first():
+        session.close()
+        return jsonify({'error': 'Email already exists'}), 400
+    user = User(email=email, password_hash=generate_password_hash(password))
+    session.add(user)
+    session.commit()
+    token = generate_token(user)
+    session.close()
+    return jsonify({'token': token})
 
-@app.route('/auth/check', methods=['POST'])
-@app.route('/api/auth/check', methods=['POST'])
-def auth_check():
-    """Optional endpoint for clients to validate password"""
-    if not APP_PASSWORD:
-        return jsonify({'ok': True, 'auth': 'not-required'})
-    provided = request.headers.get('X-App-Password') or (request.json or {}).get('password')
-    if provided == APP_PASSWORD:
-        return jsonify({'ok': True})
-    return jsonify({'ok': False}), 401
+@app.route('/auth/login', methods=['POST'])
+def login():
+    data = request.json or {}
+    email = data.get('email')
+    password = data.get('password')
+    session = SessionLocal()
+    user = session.query(User).filter_by(email=email).first()
+    if not user or not check_password_hash(user.password_hash, password):
+        session.close()
+        return jsonify({'error': 'Invalid credentials'}), 401
+    token = generate_token(user)
+    session.close()
+    return jsonify({'token': token})
 
 @app.route('/health', methods=['GET'])
 @app.route('/api/health', methods=['GET'])
@@ -1496,6 +1530,7 @@ def twemoji_proxy(filename):
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/convert', methods=['POST'])
+@require_auth
 def convert_files():
     """Convert uploaded .eml files to PDF"""
     try:
@@ -1620,6 +1655,7 @@ def convert_files():
 
 @app.route('/download/<session_id>/<filename>', methods=['GET'])
 @app.route('/api/download/<session_id>/<filename>', methods=['GET'])
+@require_auth
 def download_file(session_id, filename):
     """Download converted PDF file"""
     try:
@@ -1636,6 +1672,7 @@ def download_file(session_id, filename):
 
 @app.route('/download-all/<session_id>', methods=['GET'])
 @app.route('/api/download-all/<session_id>', methods=['GET'])
+@require_auth
 def download_all_files(session_id):
     """Download all converted PDF files as a ZIP"""
     try:
@@ -1676,7 +1713,7 @@ def lambda_handler(event, context):
             'headers': {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type, X-App-Password',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
                 'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
             },
             'body': '{"message": "MSG to PDF converter Lambda function"}'

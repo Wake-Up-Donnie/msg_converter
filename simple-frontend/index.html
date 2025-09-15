@@ -479,7 +479,7 @@
             if (currentSessionId) {
                 const link = document.createElement('a');
                 const url = new URL(`${API_URL}/download-all/${currentSessionId}`);
-                if (currentPassword) url.searchParams.set('auth', currentPassword);
+                
                 link.href = url.toString();
                 link.download = `converted_pdfs_${currentSessionId}.zip`;
                 document.body.appendChild(link);
@@ -515,7 +515,7 @@
                 const response = await fetch(`${API_URL}/convert`, {
                     method: 'POST',
                     body: formData,
-                    headers: currentPassword ? { 'X-App-Password': currentPassword } : {}
+                    headers: currentPassword ? { 'Authorization': `Bearer ${currentPassword}` } : {}
                 });
 
                 if (!response.ok) {
@@ -574,7 +574,7 @@
         function downloadFile(sessionId, pdfFilename, downloadName) {
             const link = document.createElement('a');
             const url = new URL(`${API_URL}/download/${sessionId}/${pdfFilename}`);
-            if (currentPassword) url.searchParams.set('auth', currentPassword);
+            
             link.href = url.toString();
             link.download = downloadName;
             document.body.appendChild(link);
@@ -607,7 +607,7 @@
             try {
                 const res = await fetch(`${API_URL}/auth/check`, {
                     method: 'POST',
-                    headers: currentPassword ? { 'X-App-Password': currentPassword } : {}
+                    headers: currentPassword ? { 'Authorization': `Bearer ${currentPassword}` } : {}
                 });
                 if (res.ok) {
                     // Try to parse body for more detail

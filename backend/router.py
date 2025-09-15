@@ -11,7 +11,7 @@ class LambdaRouter:
         self.logger = logging.getLogger(__name__)
         self.cors_headers = {
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type, X-App-Password, Authorization',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
             'Access-Control-Allow-Methods': 'OPTIONS, POST, GET'
         }
 
