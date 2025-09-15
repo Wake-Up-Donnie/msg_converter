@@ -1230,7 +1230,8 @@ doc_converter.eml_to_pdf = convert_eml_to_pdf
 def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url: str = None) -> bool:
     """Convert HTML to PDF using Playwright (Chromium baked into the image)."""
     max_retries = 3
-    
+    twemoji_failed = False
+
     for attempt in range(max_retries):
         logger.info(f"=== Playwright PDF Generation Attempt {attempt + 1}/{max_retries} ===")
         
@@ -1305,46 +1306,60 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
                 logger.info(f"Content loaded in {content_load_time:.2f}s")
 
                 # Inject Twemoji and inline emoji SVGs to make PDF self-contained
-                try:
-                    logger.info("Injecting Twemoji and inlining SVGs for consistent emoji rendering")
-                    # Load Twemoji library
-                    page.add_script_tag(url='https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js')
-                    
-                    # Parse emojis and inline fetched SVGs into the DOM
-                    page.evaluate(
-                        """
-                        async () => {
-                          try {
-                            if (typeof twemoji !== 'undefined') {
+                twemoji_injected = False
+                if not twemoji_failed:
+                    try:
+                        logger.info("Injecting Twemoji and inlining SVGs for consistent emoji rendering")
+                        twemoji_path = os.path.join(os.path.dirname(__file__), 'static', 'twemoji.min.js')
+                        if os.path.exists(twemoji_path):
+                            page.add_script_tag(path=twemoji_path)
+                            twemoji_injected = True
+                        else:
+                            logger.warning(f"Twemoji script not found at {twemoji_path}; skipping injection")
+                            twemoji_failed = True
+                    except Exception as tw_error:
+                        logger.warning(f"Twemoji injection failed: {tw_error}")
+                        logger.info("Continuing with system emoji fonts as fallback")
+                        twemoji_failed = True
+
+                if twemoji_injected:
+                    base_url = twemoji_base_url or 'https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/svg/'
+                    base_url_js = json.dumps(base_url)
+                    try:
+                        page.evaluate(
+                            f"""
+                        async () => {{
+                          try {{
+                            if (typeof twemoji !== 'undefined') {{
                               // First parse emojis into img tags
-                              const baseUrl = 'https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/svg/';
-                              twemoji.parse(document.body, { 
+                              const baseUrl = {base_url_js};
+                              twemoji.parse(document.body, {{
                                 base: baseUrl,
-                                folder: '', 
-                                ext: '.svg' 
-                              });
-                              
+                                folder: '',
+                                ext: '.svg'
+                              }});
+
                               // Now replace all emoji img tags with inline SVGs
                               const emojiImages = Array.from(document.querySelectorAll('img.emoji'));
                               console.log(`Found ${emojiImages.length} emoji images to inline`);
-                              
-                              await Promise.all(emojiImages.map(async (img) => {
-                                try {
+
+                              await Promise.all(emojiImages.map(async (img) => {{
+                                try {{
                                   const src = img.getAttribute('src');
                                   if (!src || !src.includes('.svg')) return;
-                                  
-                                  const response = await fetch(src, { cache: 'force-cache' });
-                                  if (!response.ok) {
+
+                                  const response = await fetch(src, {{ cache: 'force-cache' }});
+                                  if (!response.ok) {{
                                     console.warn(`Failed to fetch ${src}: ${response.status}`);
                                     return;
-                                  }
-                                  
+                                  }}
+
                                   const svgText = await response.text();
                                   const parser = new DOMParser();
                                   const svgDoc = parser.parseFromString(svgText, 'image/svg+xml');
                                   const svgElement = svgDoc.documentElement;
-                                  
-                                  if (svgElement && svgElement.tagName === 'svg') {
+
+                                  if (svgElement && svgElement.tagName === 'svg') {{
                                     // Configure SVG for inline rendering
                                     svgElement.setAttribute('width', '1em');
                                     svgElement.setAttribute('height', '1em');
@@ -1352,40 +1367,39 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
                                     svgElement.style.display = 'inline';
                                     svgElement.style.verticalAlign = 'middle';
                                     svgElement.style.fill = 'currentColor';
-                                    
+
                                     // Copy any classes from the original img
-                                    if (img.className) {
+                                    if (img.className) {{
                                       svgElement.classList.add(...img.className.split(' '));
-                                    }
-                                    
+                                    }}
+
                                     // Replace the img with the inline SVG
                                     img.replaceWith(svgElement);
                                     console.log(`Inlined emoji SVG: ${src}`);
-                                  }
-                                } catch (error) {
+                                  }}
+                                }} catch (error) {{
                                   console.warn(`Error inlining emoji ${img.src}:`, error);
-                                }
-                              }));
-                              
+                                }}
+                              }}));
+
                               console.log('Emoji SVG inlining completed');
                               return true;
-                            }
+                            }}
                             return false;
-                          } catch (error) {
+                          }} catch (error) {{
                             console.error('Twemoji injection error:', error);
                             return false;
-                          }
-                        }
+                          }}
+                        }}
                         """
-                    )
-                    
-                    # Wait for inlining to complete
-                    logger.info("Waiting for emoji SVG inlining to complete...")
-                    page.wait_for_timeout(1000)
-                    
-                except Exception as tw_error:
-                    logger.warning(f"Twemoji injection failed: {tw_error}")
-                    logger.info("Continuing with system emoji fonts as fallback")
+                        )
+
+                        # Wait for inlining to complete
+                        logger.info("Waiting for emoji SVG inlining to complete...")
+                        page.wait_for_timeout(1000)
+                    except Exception as tw_error:
+                        logger.warning(f"Twemoji SVG inlining failed: {tw_error}")
+                        logger.info("Continuing with system emoji fonts as fallback")
                 
                 # Wait a bit for any dynamic content and image decoding
                 logger.info("Waiting 1 second for dynamic content and resource fetches...")
