@@ -9,9 +9,13 @@ class LambdaRouter:
     def __init__(self, verify_browser: Callable[[], bool]):
         self.verify_browser = verify_browser
         self.logger = logging.getLogger(__name__)
+        auth_mode = os.environ.get('AUTH_MODE', 'none')
+        allow_headers = 'Content-Type, Authorization'
+        if auth_mode != 'subscription':
+            allow_headers += ', X-App-Password'
         self.cors_headers = {
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type, X-App-Password, Authorization',
+            'Access-Control-Allow-Headers': allow_headers,
             'Access-Control-Allow-Methods': 'OPTIONS, POST, GET'
         }
 
