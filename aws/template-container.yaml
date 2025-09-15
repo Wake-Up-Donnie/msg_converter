@@ -33,7 +33,9 @@ Conditions:
 Globals:
   Function:
     Timeout: 900  # 15 minutes for large files and PDF merging
-    MemorySize: 3008  # Maximum memory for PDF processing
+    MemorySize: 4096  # Increased memory for PDF processing
+    EphemeralStorage:
+      Size: 2048  # 2 GB temporary storage
 
 Resources:
   # S3 Bucket for temporary file storage and session management
