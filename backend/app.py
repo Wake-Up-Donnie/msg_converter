@@ -25,6 +25,17 @@ import subprocess
 import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 
+try:
+    from .playwright_install import (
+        ensure_playwright_browsers_installed,
+        is_missing_browser_error,
+    )
+except ImportError:  # pragma: no cover - fallback for direct execution
+    from playwright_install import (  # type: ignore
+        ensure_playwright_browsers_installed,
+        is_missing_browser_error,
+    )
+
 
 app = Flask(__name__)
 AUTH_MODE = os.environ.get('AUTH_MODE', 'none')
@@ -1201,76 +1212,88 @@ class EMLToPDFConverter:
             return html.escape(str(html_content)).replace('\n', '<br>\n')
     
     def html_to_pdf(self, html_content, output_path):
-        """Convert HTML content to PDF using Playwright"""
-        try:
-            with sync_playwright() as p:
-                # Use chromium for PDF generation
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
+        """Convert HTML content to PDF using Playwright."""
 
-                # Set content
-                page.set_content(html_content)
+        install_attempted = False
+        for attempt in range(2):
+            try:
+                with sync_playwright() as p:
+                    # Use chromium for PDF generation
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
 
-                # Convert emojis to Twemoji SVGs and inline them
-                try:
-                    twemoji_path = os.path.join(os.path.dirname(__file__), 'static', 'twemoji.min.js')
-                    if os.path.exists(twemoji_path):
-                        page.add_script_tag(path=twemoji_path)
-                    else:
-                        page.add_script_tag(url='https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js')
-                    page.evaluate(
-                        """
-                        (async () => {
-                            try {
-                                if (typeof twemoji !== 'undefined') {
-                                    // Point Twemoji <img> src to backend proxy for same-origin fetch with caching
-                                    const base = `${location.origin}/twemoji/`;
-                                    twemoji.parse(document.body, { base, folder: '', ext: '.svg' });
+                    # Set content
+                    page.set_content(html_content)
+
+                    # Convert emojis to Twemoji SVGs and inline them
+                    try:
+                        twemoji_path = os.path.join(os.path.dirname(__file__), 'static', 'twemoji.min.js')
+                        if os.path.exists(twemoji_path):
+                            page.add_script_tag(path=twemoji_path)
+                        else:
+                            page.add_script_tag(url='https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js')
+                        page.evaluate(
+                            """
+                            (async () => {
+                                try {
+                                    if (typeof twemoji !== 'undefined') {
+                                        // Point Twemoji <img> src to backend proxy for same-origin fetch with caching
+                                        const base = `${location.origin}/twemoji/`;
+                                        twemoji.parse(document.body, { base, folder: '', ext: '.svg' });
+                                    }
+                                    const imgs = Array.from(document.querySelectorAll('img.emoji'));
+                                    await Promise.all(imgs.map(async (img) => {
+                                        try {
+                                            const res = await fetch(img.src);
+                                            const svgText = await res.text();
+                                            const parser = new DOMParser();
+                                            const doc = parser.parseFromString(svgText, 'image/svg+xml');
+                                            const svg = doc.documentElement;
+                                            svg.setAttribute('width', '1em');
+                                            svg.setAttribute('height', '1em');
+                                            svg.classList.add('emoji');
+                                            img.replaceWith(svg);
+                                        } catch (e) { /* ignore */ }
+                                    }));
+                                    return true;
+                                } catch (e) {
+                                    return false;
                                 }
-                                const imgs = Array.from(document.querySelectorAll('img.emoji'));
-                                await Promise.all(imgs.map(async (img) => {
-                                    try {
-                                        const res = await fetch(img.src);
-                                        const svgText = await res.text();
-                                        const parser = new DOMParser();
-                                        const doc = parser.parseFromString(svgText, 'image/svg+xml');
-                                        const svg = doc.documentElement;
-                                        svg.setAttribute('width', '1em');
-                                        svg.setAttribute('height', '1em');
-                                        svg.classList.add('emoji');
-                                        img.replaceWith(svg);
-                                    } catch (e) { /* ignore */ }
-                                }));
-                                return true;
-                            } catch (e) {
-                                return false;
-                            }
-                        })();
-                        """
+                            })();
+                            """
+                        )
+                    except Exception as tw:
+                        logger.info(f"Twemoji injection failed or skipped: {tw}")
+
+                    # Give time for resources
+                    page.wait_for_timeout(500)
+
+                    page.pdf(
+                        path=output_path,
+                        format='A4',
+                        margin={
+                            'top': '1in',
+                            'right': '1in',
+                            'bottom': '1in',
+                            'left': '1in'
+                        },
+                        print_background=True,
+                        prefer_css_page_size=False
                     )
-                except Exception as tw:
-                    logger.info(f"Twemoji injection failed or skipped: {tw}")
+                    return
+            except Exception as e:
+                if (not install_attempted) and is_missing_browser_error(e):
+                    install_attempted = True
+                    logger.warning("Playwright browser not found; attempting automatic installation of Chromium.")
+                    if ensure_playwright_browsers_installed(logger):
+                        logger.info("Playwright Chromium installed successfully; retrying PDF generation.")
+                        continue
+                    else:
+                        logger.error("Automatic Playwright installation failed; cannot retry PDF generation.")
+                logger.error(f"Error converting HTML to PDF: {str(e)}")
+                raise Exception(f"Failed to generate PDF: {str(e)}") from e
 
-                # Give time for resources
-                page.wait_for_timeout(500)
-
-                page.pdf(
-                    path=output_path,
-                    format='A4',
-                    margin={
-                        'top': '1in',
-                        'right': '1in',
-                        'bottom': '1in',
-                        'left': '1in'
-                    },
-                    print_background=True,
-                    prefer_css_page_size=False
-                )
-
-                browser.close()
-        except Exception as e:
-            logger.error(f"Error converting HTML to PDF: {str(e)}")
-            raise Exception(f"Failed to generate PDF: {str(e)}")
+        raise Exception("Failed to generate PDF after installing Playwright browser")
 
     def html_to_pdf_bytes(self, html_content):
         """Convert HTML content to PDF bytes using Playwright"""

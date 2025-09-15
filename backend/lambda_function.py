@@ -22,6 +22,17 @@ from pypdf import PdfReader, PdfWriter
 import shutil
 import subprocess
 from pathlib import Path
+
+try:
+    from .playwright_install import (
+        ensure_playwright_browsers_installed,
+        is_missing_browser_error,
+    )
+except ImportError:  # pragma: no cover - fallback when executed as script
+    from playwright_install import (  # type: ignore
+        ensure_playwright_browsers_installed,
+        is_missing_browser_error,
+    )
 from converter import EmailConverter
 from router import LambdaRouter
 from document_converter import DocumentConverter
@@ -699,9 +710,13 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
 
     body = None
     logger.info(f"DEBUGGING: Body selection - HTML candidates: {len(html_candidates)}, Text candidates: {len(text_candidates)}")
-    
+
+    if html_candidates:
+        body = max(html_candidates, key=lambda t: t[0])[1]
+        logger.info(f"DEBUGGING: Selected HTML body with {len(body)} chars")
+
     # CRITICAL FIX: Analyze text parts to avoid duplication with embedded attachments
-    if len(text_candidates) > 1:
+    elif len(text_candidates) > 1:
         logger.info(f"DEBUGGING: Multiple text parts detected - analyzing for forwarded content")
         
         # Check if there are embedded message attachments that might duplicate forwarded content
@@ -763,9 +778,6 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
     elif text_candidates:
         body = max(text_candidates, key=lambda t: t[0])[1]
         logger.info(f"DEBUGGING: Selected single text body with {len(body)} chars")
-    elif html_candidates:
-        body = max(html_candidates, key=lambda t: t[0])[1]
-        logger.info(f"DEBUGGING: Selected HTML body with {len(body)} chars")
     
     if not body:
         body = "No content available"
@@ -1292,6 +1304,7 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
     """Convert HTML to PDF using Playwright (Chromium baked into the image)."""
     max_retries = 3
     twemoji_failed = False
+    install_attempted = False
 
     for attempt in range(max_retries):
         logger.info(f"=== Playwright PDF Generation Attempt {attempt + 1}/{max_retries} ===")
@@ -1402,7 +1415,7 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
 
                               // Now replace all emoji img tags with inline SVGs
                               const emojiImages = Array.from(document.querySelectorAll('img.emoji'));
-                              console.log(`Found ${emojiImages.length} emoji images to inline`);
+                              console.log(`Found ${{emojiImages.length}} emoji images to inline`);
 
                               await Promise.all(emojiImages.map(async (img) => {{
                                 try {{
@@ -1411,7 +1424,7 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
 
                                   const response = await fetch(src, {{ cache: 'force-cache' }});
                                   if (!response.ok) {{
-                                    console.warn(`Failed to fetch ${src}: ${response.status}`);
+                                    console.warn(`Failed to fetch ${{src}}: ${{response.status}}`);
                                     return;
                                   }}
 
@@ -1436,10 +1449,10 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
 
                                     // Replace the img with the inline SVG
                                     img.replaceWith(svgElement);
-                                    console.log(`Inlined emoji SVG: ${src}`);
+                                    console.log(`Inlined emoji SVG: ${{src}}`);
                                   }}
                                 }} catch (error) {{
-                                  console.warn(`Error inlining emoji ${img.src}:`, error);
+                                  console.warn(`Error inlining emoji ${{img.src}}:`, error);
                                 }}
                               }}));
 
@@ -1497,15 +1510,24 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
         except Exception as e:
             logger.error(f"Playwright PDF generation attempt {attempt + 1} failed: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
-            
+
             # Log stack trace for debugging
             import traceback
             logger.error(f"Stack trace: {traceback.format_exc()}")
-            
+
+            if (not install_attempted) and is_missing_browser_error(e):
+                install_attempted = True
+                logger.warning("Playwright browser not found; attempting to install Chromium automatically.")
+                if ensure_playwright_browsers_installed(logger):
+                    logger.info("Playwright Chromium installed successfully; retrying PDF generation.")
+                    continue
+                else:
+                    logger.error("Automatic Playwright installation failed; proceeding with standard retry handling.")
+
             if attempt == max_retries - 1:
                 logger.error(f"=== All Playwright attempts failed after {max_retries} tries ===")
                 raise
-            
+
             retry_delay = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
             logger.info(f"Waiting {retry_delay}s before retry...")
             time.sleep(retry_delay)
