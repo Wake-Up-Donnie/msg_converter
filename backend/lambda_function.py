@@ -21,6 +21,7 @@ from fpdf import FPDF
 from pypdf import PdfReader, PdfWriter
 import shutil
 import subprocess
+from pathlib import Path
 from converter import EmailConverter
 from router import LambdaRouter
 from document_converter import DocumentConverter
@@ -819,7 +820,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
     import html  # Import html module to avoid variable conflict
     import tempfile  # Import tempfile module to avoid variable conflict
     logger.info("=== CONVERT_EML_TO_PDF STARTED ===")
-    
+    temp_paths: list[str] = []
     try:
         logger.info("Parsing EML message...")
         logger.info(f"DEBUGGING: EML content size: {len(eml_content)} bytes")
@@ -1014,12 +1015,23 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         """
         logger.info(f"HTML content created: {len(html_content)} characters")
 
+        # Check available /tmp space before creating potentially large PDFs
+        required_space = len(eml_content)
+        required_space += sum(len(a.get('data', b'')) for a in (attachments or []))
+        required_space += sum(len(a.get('data', b'')) for a in (msg_attachments or []))
+        _, _, free_space = shutil.disk_usage('/tmp')
+        logger.info(f"/tmp free space: {free_space} bytes; estimated need: {required_space} bytes")
+        if free_space < required_space:
+            logger.error("Insufficient /tmp space for PDF generation")
+            return False
+
         # Generate body PDF to a temporary file, then merge PDF attachments (if any)
         logger.info("Preparing to generate body PDF and merge attachments if present...")
         body_pdf_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_body:
                 body_pdf_path = tmp_body.name
+            temp_paths.append(body_pdf_path)
             logger.info(f"Temporary body PDF path: {body_pdf_path}")
 
             # Decide rendering path
@@ -1132,34 +1144,30 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                                 # Generate PDF from HTML
                                 with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_nested:
                                     pdf_path = tmp_nested.name
-                                
-                                try:
-                                    # Try Playwright first, fallback to FPDF
-                                    if os.environ.get('TEST_MODE', '').lower() == 'true':
+                                temp_paths.append(pdf_path)
+
+                                # Try Playwright first, fallback to FPDF
+                                if os.environ.get('TEST_MODE', '').lower() == 'true':
+                                    nested_ok = fallback_html_to_pdf(html_content, pdf_path)
+                                else:
+                                    try:
+                                        nested_ok = html_to_pdf_playwright(html_content, pdf_path, twemoji_base_url)
+                                    except Exception:
                                         nested_ok = fallback_html_to_pdf(html_content, pdf_path)
-                                    else:
-                                        try:
-                                            nested_ok = html_to_pdf_playwright(html_content, pdf_path, twemoji_base_url)
-                                        except Exception:
-                                            nested_ok = fallback_html_to_pdf(html_content, pdf_path)
-                                    
-                                    if nested_ok and os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
-                                        # Read the generated PDF and add to attachments
-                                        with open(pdf_path, 'rb') as f:
-                                            nested_pdf_bytes = f.read()
-                                        
-                                        pdf_attachments.append({
-                                            'filename': f"{base_name}.pdf",
-                                            'content_type': 'application/pdf',
-                                            'data': nested_pdf_bytes
-                                        })
-                                        logger.info(f"Successfully converted text attachment to PDF: {base_name}.pdf ({len(nested_pdf_bytes)} bytes)")
-                                    else:
-                                        logger.warning(f"Failed to convert text attachment to PDF: {att_filename}")
-                                        
-                                finally:
-                                    if os.path.exists(pdf_path):
-                                        os.unlink(pdf_path)
+
+                                if nested_ok and os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                                    # Read the generated PDF and add to attachments
+                                    with open(pdf_path, 'rb') as f:
+                                        nested_pdf_bytes = f.read()
+
+                                    pdf_attachments.append({
+                                        'filename': f"{base_name}.pdf",
+                                        'content_type': 'application/pdf',
+                                        'data': nested_pdf_bytes
+                                    })
+                                    logger.info(f"Successfully converted text attachment to PDF: {base_name}.pdf ({len(nested_pdf_bytes)} bytes)")
+                                else:
+                                    logger.warning(f"Failed to convert text attachment to PDF: {att_filename}")
                                         
                         except Exception as text_e:
                             logger.warning(f"Error converting text attachment {att_filename} to PDF: {text_e}")
@@ -1205,9 +1213,9 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             logger.info("Combined PDF (body + attachments) written successfully (no attachment title pages)")
             return True
         finally:
-            if body_pdf_path:
+            for p in temp_paths:
                 try:
-                    os.unlink(body_pdf_path)
+                    os.unlink(p)
                 except Exception:
                     pass
 
@@ -2233,6 +2241,12 @@ def handle_upload_url(event: Dict[str, Any]) -> Dict[str, Any]:
 def handle_convert_s3(event: Dict[str, Any]) -> Dict[str, Any]:
     """Convert files that were uploaded directly to S3 (by key) and return batch results."""
     try:
+        for p in Path('/tmp').glob('*'):
+            if p.is_file() or p.is_symlink():
+                p.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(p, ignore_errors=True)
+
         parser = RequestParser(event)
         data = parser.json()
         if not data:
