@@ -27,13 +27,17 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 
 app = Flask(__name__)
+AUTH_MODE = os.environ.get('AUTH_MODE', 'none')
 # Allow custom auth header and file download headers
+cors_allow_headers = ["Content-Type", "Authorization"]
+if AUTH_MODE != 'subscription':
+    cors_allow_headers.append("X-App-Password")
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
     supports_credentials=False,
     expose_headers=["Content-Disposition"],
-    allow_headers=["Content-Type", "X-App-Password"]
+    allow_headers=cors_allow_headers
 )
 
 # Configure logging
@@ -52,7 +56,6 @@ else:
     logger.info("Password protection: DISABLED (APP_PASSWORD not set)")
 
 # Subscription authentication mode
-AUTH_MODE = os.environ.get('AUTH_MODE', 'none')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key')
 if AUTH_MODE == 'subscription':
     try:
@@ -1484,9 +1487,11 @@ converter = EMLToPDFConverter()
 @app.before_request
 def require_password():
     try:
+        if AUTH_MODE == 'subscription':
+            return None
         # Allow health checks and Twemoji assets without password
         path = request.path or ''
-        if path.startswith('/health') or path.startswith('/twemoji') or (AUTH_MODE == 'subscription' and path.startswith('/auth')):
+        if path.startswith('/health') or path.startswith('/twemoji'):
             return None
         # Preflight requests
         if request.method == 'OPTIONS':
@@ -1542,6 +1547,8 @@ if AUTH_MODE == 'subscription':
 @app.route('/api/auth/check', methods=['POST'])
 def auth_check():
     """Optional endpoint for clients to validate password"""
+    if AUTH_MODE == 'subscription':
+        return jsonify({'ok': True, 'auth': 'subscription'})
     if not APP_PASSWORD:
         return jsonify({'ok': True, 'auth': 'not-required'})
     provided = request.headers.get('X-App-Password') or (request.json or {}).get('password')
@@ -1767,7 +1774,7 @@ def lambda_handler(event, context):
             'headers': {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type, X-App-Password',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization' + (', X-App-Password' if AUTH_MODE != 'subscription' else ''),
                 'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
             },
             'body': '{"message": "MSG to PDF converter Lambda function"}'
