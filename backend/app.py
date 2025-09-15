@@ -1153,7 +1153,11 @@ class EMLToPDFConverter:
 
                 # Convert emojis to Twemoji SVGs and inline them
                 try:
-                    page.add_script_tag(url='https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js')
+                    twemoji_path = os.path.join(os.path.dirname(__file__), 'static', 'twemoji.min.js')
+                    if os.path.exists(twemoji_path):
+                        page.add_script_tag(path=twemoji_path)
+                    else:
+                        page.add_script_tag(url='https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/twemoji.min.js')
                     page.evaluate(
                         """
                         (async () => {
