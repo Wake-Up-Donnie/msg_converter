@@ -463,6 +463,60 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
     html_candidates = []
     text_candidates = []
 
+    supported_inline_image_types = {
+        'image/png',
+        'image/jpeg',
+        'image/jpg',
+        'image/gif',
+        'image/webp',
+        'image/bmp',
+        'image/svg+xml',
+    }
+
+    def ensure_displayable_image(img_bytes, content_type, source_name=None):
+        """Convert unsupported inline image formats (e.g., TIFF) into browser-friendly PNG."""
+        if not isinstance(img_bytes, (bytes, bytearray)) or not img_bytes:
+            return img_bytes, content_type
+
+        normalized_ct = (content_type or '').lower()
+        if normalized_ct in supported_inline_image_types:
+            return bytes(img_bytes), normalized_ct or 'image/png'
+
+        source_label = source_name or 'inline image'
+        try:
+            from PIL import Image
+        except Exception as import_err:
+            logger.warning(
+                f"Unable to import Pillow for converting {source_label} ({normalized_ct or 'unknown'}); rendering may fail: {import_err}"
+            )
+            return bytes(img_bytes), content_type or 'application/octet-stream'
+
+        try:
+            with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                try:
+                    if getattr(pil_img, 'n_frames', 1) > 1:
+                        pil_img.seek(0)
+                except Exception:
+                    pass
+
+                if pil_img.mode in ('P', 'PA', 'LA', 'RGBA'):
+                    pil_img = pil_img.convert('RGBA')
+                elif pil_img.mode not in ('RGB', 'L'):
+                    pil_img = pil_img.convert('RGB')
+
+                buffer = io.BytesIO()
+                pil_img.save(buffer, format='PNG')
+                converted = buffer.getvalue()
+                logger.info(
+                    f"Converted inline image {source_label} from {normalized_ct or 'unknown'} to image/png for browser rendering"
+                )
+                return converted, 'image/png'
+        except Exception as convert_err:
+            logger.warning(
+                f"Failed to convert inline image {source_label} ({normalized_ct or 'unknown'}) to PNG: {convert_err}"
+            )
+        return bytes(img_bytes), content_type or 'application/octet-stream'
+
     def process_part(part):
         try:
             ctype = part.get_content_type()
@@ -522,6 +576,13 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                     if isinstance(payload, (bytes, bytearray)):
                         img_bytes = payload
                 if img_bytes:
+                    img_bytes, ctype_for_data = ensure_displayable_image(
+                        img_bytes,
+                        ctype_for_data or ctype,
+                        source_name=fname or cloc or cid,
+                    )
+                    if not ctype_for_data:
+                        ctype_for_data = 'image/png'
                     b64 = base64.b64encode(img_bytes).decode('utf-8')
                     data_url = f"data:{ctype_for_data};base64,{b64}"
                     keys = set()
