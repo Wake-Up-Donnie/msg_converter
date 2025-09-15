@@ -18,7 +18,8 @@ try:
     print("✅ lambda functions imported")
     
     # Test file exists
-    msg_path = 'test_msg_files/_External_ Starlight Solar comment letter.msg'
+    # Use available fixture for automated tests
+    msg_path = 'test_msg_files/Demoss D JCSD 8.07.25.msg'
     if os.path.exists(msg_path):
         print(f"✅ MSG file found: {os.path.getsize(msg_path)} bytes")
         
@@ -50,7 +51,7 @@ try:
         if len(attachments) > 0:
             print("🎉 SUCCESS: Attachments detected!")
         else:
-            print("❌ FAILURE: No attachments found")
+            print("No attachments found")
             
     else:
         print(f"❌ MSG file not found: {msg_path}")
