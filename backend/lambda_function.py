@@ -1077,6 +1077,90 @@ def _format_address_header(value: str | None) -> str:
     return value
 
 
+def _parse_address_pairs(value: str | None) -> list[tuple[str, str]]:
+    """Return parsed ``(display, address)`` tuples for an address header."""
+    if value is None:
+        return []
+
+    if not isinstance(value, str):
+        value = str(value)
+
+    candidate = value.strip()
+    if not candidate:
+        return []
+
+    pairs: list[tuple[str, str]] = []
+    try:
+        raw_addresses = getaddresses([candidate])
+    except Exception:
+        raw_addresses = []
+
+    for display, addr in raw_addresses:
+        display = (display or '').strip()
+        addr = (addr or '').strip()
+        if display or addr:
+            pairs.append((display, addr))
+
+    if pairs:
+        return pairs
+
+    fallback_display, fallback_addr = parseaddr(candidate)
+    fallback_display = (fallback_display or '').strip()
+    fallback_addr = (fallback_addr or '').strip()
+
+    if fallback_display or fallback_addr:
+        return [(fallback_display, fallback_addr)]
+
+    return []
+
+
+def _format_address_header_compact(value: str | None) -> str:
+    """Return a compact string like ``"Name addr"`` without angle brackets."""
+    pairs = _parse_address_pairs(value)
+    if pairs:
+        formatted: list[str] = []
+        for display, addr in pairs:
+            if display and addr:
+                formatted.append(f"{display} {addr}")
+            elif addr:
+                formatted.append(addr)
+            elif display:
+                formatted.append(display)
+
+        if formatted:
+            return ', '.join(formatted)
+
+    if value is None:
+        return "Unknown"
+
+    return str(value).strip()
+
+
+def _build_sender_value_html(value: str | None) -> str:
+    """Create HTML markup that bolds the sender name and keeps email lightweight."""
+    pairs = _parse_address_pairs(value)
+
+    if not pairs:
+        fallback = (value or 'Unknown Sender').strip() or 'Unknown Sender'
+        return f"<span class=\"from-name\">{html.escape(fallback)}</span>"
+
+    if len(pairs) > 1:
+        compact = _format_address_header_compact(value)
+        safe = html.escape(compact if compact else (value or 'Unknown Sender'))
+        return f"<span class=\"from-name\">{safe}</span>"
+
+    display, addr = pairs[0]
+    primary = display or addr or (value or '').strip() or 'Unknown Sender'
+
+    segments: list[str] = []
+    segments.append(f"<span class=\"from-name\">{html.escape(primary)}</span>")
+
+    if addr and addr != primary:
+        segments.append(f"<span class=\"from-email\">{html.escape(addr)}</span>")
+
+    return ' '.join(segments)
+
+
 def _extract_display_date(msg) -> str:
     """Return a human-readable date for the message with sensible fallbacks.
     Prefers the Date header as-is; falls back to common alternative headers or the trailing
@@ -1134,6 +1218,9 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         recipient_decoded = _safe_decode_header(msg.get('To', 'Unknown Recipient'))
         sender = _format_address_header(sender_decoded)
         recipient = _format_address_header(recipient_decoded)
+        recipient_compact = _format_address_header_compact(recipient_decoded)
+        recipient_display = recipient_compact or recipient
+        sender_value_html = _build_sender_value_html(sender_decoded)
         date_display = _extract_display_date(msg)
         logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}'")
 
@@ -1304,6 +1391,41 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 li {{ margin: 0 0 4px; }}
                 h1, h2, h3, h4, h5, h6 {{ margin: 12px 0 6px; }}
                 ul, ol {{ margin: 0 0 10px 20px; padding-left: 18px; }}
+                /* CRITICAL: Ensure email header is NOT affected by email-body overrides */
+                .email-header {{
+                    margin: 0 0 15px 0; /* Increased bottom margin to fix spacing */
+                    padding: 0;
+                    font-size: 11px;
+                    line-height: 1.25;
+                    color: #1f1f1f;
+                }}
+                .email-header .header-item {{
+                    margin: 0;
+                }}
+                .email-header .header-item + .header-item {{
+                    margin-top: 3px; /* Increased from 2px for better spacing */
+                }}
+                .email-header .label {{
+                    font-weight: 700 !important; /* Make bold more explicit */
+                    color: #000 !important;
+                    margin-right: 6px;
+                    display: inline-block;
+                }}
+                .email-header .value {{
+                    display: inline;
+                }}
+                .email-header .from-value .from-name {{
+                    font-weight: 700 !important; /* Make bold more explicit */
+                }}
+                .email-header .from-value .from-email {{
+                    margin-left: 6px;
+                }}
+                .email-header .subject-value {{
+                    font-weight: 600 !important; /* Make bold more explicit */
+                }}
+                .email-body {{
+                    padding: 0 10px 10px 0;
+                }}
                 .email-body, .email-body * {{
                     /* Forcefully override justification from email inline styles */
                     white-space: normal !important; /* Override Outlook's 'pre' on spans */
@@ -1323,31 +1445,6 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 .emoji {{
                     font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
                 }}
-                .email-header {{
-                    margin: 0 0 10px 0;
-                    padding: 0;
-                    font-size: 11px;
-                    line-height: 1.45;
-                    color: #1f1f1f;
-                }}
-                .email-body {{ padding: 0 10px 10px 0; }}
-                .header-item {{
-                    display: flex;
-                    align-items: baseline;
-                    gap: 8px;
-                    margin: 0 0 6px;
-                }}
-                .header-item:last-child {{
-                    margin-bottom: 0;
-                }}
-                .label {{
-                    font-weight: 600;
-                    color: #444;
-                    min-width: 64px;
-                }}
-                .value {{
-                    flex: 1;
-                }}
                 img {{
                     max-width: 100%;
                     height: auto;
@@ -1366,10 +1463,10 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         </head>
         <body>
             <div class="email-header">
-                <div class="header-item"><span class="label">From:</span><span class="value">{html.escape(sender)}</span></div>
-                <div class="header-item"><span class="label">Sent:</span><span class="value">{html.escape(date_display)}</span></div>
-                <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient)}</span></div>
-                <div class="header-item"><span class="label">Subject:</span><span class="value">{html.escape(subject)}</span></div>
+                <div class="header-item header-from"><span class="label">From:</span><span class="value from-value">{sender_value_html}</span></div>
+                <div class="header-item"><span class="label">Subject:</span><span class="value subject-value">{html.escape(subject)}</span></div>
+                <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
+                <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient_display)}</span></div>
             </div>
             <div class="email-body wrap">
                 {body}{attachment_inline_note}
@@ -1378,14 +1475,29 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         </html>
         """
         logger.info(f"HTML content created: {len(html_content)} characters")
+        
+        # DIAGNOSTIC: Log header-specific CSS and HTML structure
         try:
+            # Count font-weight occurrences in CSS
+            font_weight_count = html_content.lower().count('font-weight')
+            label_class_count = html_content.count('class="label"')
+            header_section = html_content[html_content.find('<div class="email-header">'):html_content.find('</div>', html_content.find('<div class="email-header">'))+6]
+            
+            logger.info(f"HEADER DIAGNOSTIC: font-weight declarations in CSS: {font_weight_count}")
+            logger.info(f"HEADER DIAGNOSTIC: label class elements: {label_class_count}")
+            logger.info(f"HEADER DIAGNOSTIC: Header HTML structure: {header_section[:500]}...")
+            
+            # Check for CSS conflicts
+            if '.email-body *' in html_content and 'font-weight' in html_content:
+                logger.info("HEADER DIAGNOSTIC: Potential CSS conflict detected - .email-body * selector present with font-weight rules")
+            
             # Helpful diagnostics to ensure bold cues are present upstream
             if 'b>' in html_content or 'strong' in html_content.lower() or 'font-weight' in html_content.lower():
                 logger.info("Bold cues detected in composed HTML (tags or inline styles present)")
             else:
                 logger.warning("No bold cues found in composed HTML; upstream body may be plaintext-only")
-        except Exception:
-            pass
+        except Exception as diag_e:
+            logger.warning(f"Header diagnostic logging failed: {diag_e}")
 
         # Check available /tmp space before creating potentially large PDFs
         required_space = len(eml_content)
