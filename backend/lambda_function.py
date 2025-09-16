@@ -1221,6 +1221,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     word-spacing: normal !important;
                     text-align-last: left !important;
                 }}
+                .email-body b, .email-body strong {{ font-weight: 700; }}
                 [style*="text-align:justify"], [style*="text-align: justify"] {{
                   text-align: left !important;
                 }}
