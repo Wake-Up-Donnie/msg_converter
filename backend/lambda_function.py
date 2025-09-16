@@ -1190,7 +1190,8 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 body {{
                     font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
                     line-height: 1.35;
-                    margin: 20px;
+                    margin: 0;
+                    padding: 0;
                     color: #333;
                     word-wrap: break-word;
                     /* --- FIX FOR WORD SPACING --- */
@@ -1231,13 +1232,13 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
                 }}
                 .email-header {{
-                    margin-bottom: 20px;
+                    margin: 0 0 10px 0;
                     padding: 0;
-                    font-size: 13px;
+                    font-size: 11px;
                     line-height: 1.45;
                     color: #1f1f1f;
                 }}
-                .email-body {{ padding: 10px; }}
+                .email-body {{ padding: 0 10px 10px 0; }}
                 .header-item {{
                     display: flex;
                     align-items: baseline;
