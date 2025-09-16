@@ -1275,9 +1275,9 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         <body>
             <div class="email-header">
                 <div class="header-item"><span class="label">From:</span><span class="value">{html.escape(sender)}</span></div>
+                <div class="header-item"><span class="label">Sent:</span><span class="value">{html.escape(date_display)}</span></div>
                 <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient)}</span></div>
                 <div class="header-item"><span class="label">Subject:</span><span class="value">{html.escape(subject)}</span></div>
-                <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
             </div>
             <div class="email-body wrap">
                 {body}{attachment_inline_note}
