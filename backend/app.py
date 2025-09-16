@@ -656,7 +656,10 @@ class EMLToPDFConverter:
                         padding-top: 6px;
                     }}
                     .content {{
-                        max-width: 100%;
+                        max-width: 800px;
+                        width: 100%;
+                        margin: 0 auto;
+                        white-space: pre-wrap;
                         word-wrap: break-word;
                     }}
                     img {{
