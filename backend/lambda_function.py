@@ -11,7 +11,13 @@ from email.policy import default
 from email.header import decode_header
 from email.message import EmailMessage
 from email.generator import BytesGenerator
-from email.utils import parseaddr, parsedate_to_datetime, format_datetime
+from email.utils import (
+    parseaddr,
+    parsedate_to_datetime,
+    format_datetime,
+    getaddresses,
+    formataddr,
+)
 from datetime import datetime, timezone
 import io
 import html
@@ -988,6 +994,63 @@ def _safe_decode_header(value) -> str:
             return "Unknown"
 
 
+def _format_address_header(value: str | None) -> str:
+    """Normalize an address header to ``"Name <addr>"`` tokens when possible."""
+    if value is None:
+        return "Unknown"
+
+    if not isinstance(value, str):
+        value = str(value)
+
+    value = value.strip()
+    if not value:
+        return value
+
+    formatted_parts: list[str] = []
+
+    try:
+        address_candidates = getaddresses([value])
+    except Exception:
+        address_candidates = []
+
+    for display, addr in address_candidates:
+        candidate = ""
+        if display or addr:
+            try:
+                candidate = formataddr((display, addr))
+            except Exception:
+                candidate = addr or display
+
+        if not candidate:
+            continue
+
+        parsed_display, parsed_addr = parseaddr(candidate)
+        parsed_display = parsed_display.strip()
+        parsed_addr = parsed_addr.strip()
+
+        if parsed_addr:
+            if parsed_display:
+                formatted_parts.append(f"{parsed_display} <{parsed_addr}>")
+            else:
+                formatted_parts.append(parsed_addr)
+        elif parsed_display:
+            formatted_parts.append(parsed_display)
+
+    if formatted_parts:
+        return ', '.join(formatted_parts)
+
+    parsed_display, parsed_addr = parseaddr(value)
+    parsed_display = parsed_display.strip()
+    parsed_addr = parsed_addr.strip()
+
+    if parsed_addr:
+        if parsed_display:
+            return f"{parsed_display} <{parsed_addr}>"
+        return parsed_addr
+
+    return value
+
+
 def _extract_display_date(msg) -> str:
     """Return a human-readable date for the message with sensible fallbacks.
     Prefers the Date header as-is; falls back to common alternative headers or the trailing
@@ -1041,8 +1104,10 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
 
         # Extract basic email information (decode safely)
         subject = _safe_decode_header(msg.get('Subject', 'No Subject'))
-        sender = _safe_decode_header(msg.get('From', 'Unknown Sender'))
-        recipient = _safe_decode_header(msg.get('To', 'Unknown Recipient'))
+        sender_decoded = _safe_decode_header(msg.get('From', 'Unknown Sender'))
+        recipient_decoded = _safe_decode_header(msg.get('To', 'Unknown Recipient'))
+        sender = _format_address_header(sender_decoded)
+        recipient = _format_address_header(recipient_decoded)
         date_display = _extract_display_date(msg)
         logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}'")
 
