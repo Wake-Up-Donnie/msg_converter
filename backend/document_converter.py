@@ -188,8 +188,7 @@ class DocumentConverter:
 
             convert_options = {
                 'convert_image': mammoth.images.img_element(convert_image),
-                'ignore_empty_paragraphs': False,
-                'preserve_empty_paragraphs': True
+                'ignore_empty_paragraphs': False
             }
 
             with io.BytesIO(docx_data) as docx_stream:
@@ -355,4 +354,3 @@ class DocumentConverter:
                     os.remove(pdf_path)
             except Exception:
                 pass
-

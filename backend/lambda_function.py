@@ -21,6 +21,7 @@ from email.utils import (
 from datetime import datetime, timezone
 import io
 import html
+from html.parser import HTMLParser
 import re
 import textwrap
 from playwright.sync_api import sync_playwright
@@ -847,8 +848,16 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
     process_message(msg)
 
     body = None
+    # Prefer HTML when available to preserve formatting (bold, italics, etc.)
+    html_body: str | None = None
+    html_length = 0
+    if html_candidates:
+        html_length, html_body = max(html_candidates, key=lambda t: t[0])
+
+    text_body: str | None = None
+    text_length = 0
     logger.info(f"DEBUGGING: Body selection - HTML candidates: {len(html_candidates)}, Text candidates: {len(text_candidates)}")
-    
+
     # CRITICAL FIX: Analyze text parts to avoid duplication with embedded attachments
     if len(text_candidates) > 1:
         logger.info(f"DEBUGGING: Multiple text parts detected - analyzing for forwarded content")
@@ -896,8 +905,9 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
         if has_embedded_msg and original_parts:
             logger.info(f"DEBUGGING: Using only original parts ({len(original_parts)}) - forwarded content will appear as attachment")
             combined_parts = [content for length, content in original_parts]
-            body = '<br><br>'.join(combined_parts)
-            logger.info(f"DEBUGGING: Original-only body content: {len(body)} chars total")
+            text_body = '<br><br>'.join(combined_parts)
+            text_length = len(text_body)
+            logger.info(f"DEBUGGING: Original-only body content: {text_length} chars total")
         else:
             # No embedded attachments or no original parts found - combine all
             logger.info(f"DEBUGGING: No embedded attachments or no original parts - combining all text parts")
@@ -906,16 +916,32 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                 -t[0]
             ))
             combined_parts = [content for length, content in sorted_text]
-            body = '<br><br>'.join(combined_parts)
-            logger.info(f"DEBUGGING: All-parts combined content: {len(body)} chars total")
+            text_body = '<br><br>'.join(combined_parts)
+            text_length = len(text_body)
+            logger.info(f"DEBUGGING: All-parts combined content: {text_length} chars total")
         
     elif text_candidates:
-        body = max(text_candidates, key=lambda t: t[0])[1]
-        logger.info(f"DEBUGGING: Selected single text body with {len(body)} chars")
-    elif html_candidates:
-        body = max(html_candidates, key=lambda t: t[0])[1]
-        logger.info(f"DEBUGGING: Selected HTML body with {len(body)} chars")
-    
+        text_length, text_body = max(text_candidates, key=lambda t: t[0])
+        logger.info(f"DEBUGGING: Selected single text body with {text_length} chars")
+
+    # Final decision: if an HTML body exists, prefer it to preserve formatting
+    if html_body:
+        if text_body and html_body != text_body:
+            logger.info(
+                "DEBUGGING: Preferring HTML body with %s chars over text body with %s chars to preserve formatting",
+                html_length,
+                text_length,
+            )
+        else:
+            logger.info(
+                "DEBUGGING: Using HTML body (%s chars); text was %s",
+                html_length,
+                text_length if text_body else 'absent',
+            )
+        body = html_body
+    elif text_body is not None:
+        body = text_body
+
     if not body:
         body = "No content available"
     
@@ -1352,6 +1378,14 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         </html>
         """
         logger.info(f"HTML content created: {len(html_content)} characters")
+        try:
+            # Helpful diagnostics to ensure bold cues are present upstream
+            if 'b>' in html_content or 'strong' in html_content.lower() or 'font-weight' in html_content.lower():
+                logger.info("Bold cues detected in composed HTML (tags or inline styles present)")
+            else:
+                logger.warning("No bold cues found in composed HTML; upstream body may be plaintext-only")
+        except Exception:
+            pass
 
         # Check available /tmp space before creating potentially large PDFs
         required_space = len(eml_content)
@@ -1791,39 +1825,248 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
     logger.error("Unexpected exit from retry loop")
     return False
 
-doc_converter.html_to_pdf = html_to_pdf_playwright
+def _html_to_pdf_with_fallback(html_content: str, output_path: str) -> bool:
+    try:
+        return html_to_pdf_playwright(html_content, output_path, None)
+    except Exception as e:
+        logger.error(f"Attachment HTML render failed with Playwright: {e}; falling back to FPDF")
+        return fallback_html_to_pdf(html_content, output_path)
+
+doc_converter.html_to_pdf = _html_to_pdf_with_fallback
+
+
+def _style_flags_from_attrs(attrs: dict[str, str]) -> tuple[bool, bool]:
+    """Return (bold, italic) flags inferred from inline style/class attributes."""
+    bold = False
+    italic = False
+
+    style = attrs.get('style') or ''
+    if style:
+        try:
+            declarations = {}
+            for chunk in style.split(';'):
+                if ':' not in chunk:
+                    continue
+                name, value = chunk.split(':', 1)
+                declarations[name.strip().lower()] = value.strip().lower()
+            weight = declarations.get('font-weight')
+            if weight and any(token in weight for token in ('bold', '600', '700', '800', '900')) and 'normal' not in weight:
+                bold = True
+            style_prop = declarations.get('font-style')
+            if style_prop and any(token in style_prop for token in ('italic', 'oblique')) and 'normal' not in style_prop:
+                italic = True
+        except Exception:
+            pass
+
+    cls = attrs.get('class') or ''
+    if cls:
+        try:
+            tokens = re.split(r'\s+', cls.lower())
+            if not bold and any('bold' in token for token in tokens):
+                bold = True
+            if not italic and any('italic' in token for token in tokens):
+                italic = True
+        except Exception:
+            pass
+
+    return bold, italic
+
+
+class _FPDFHTMLParser(HTMLParser):
+    """Minimal HTML parser that keeps track of bold text for the FPDF fallback."""
+
+    _block_tags = {
+        'article', 'div', 'p', 'section', 'table', 'thead', 'tbody', 'tfoot', 'tr'
+    }
+    _heading_tags = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fragments: list[dict[str, object]] = []
+        self.bold_depth = 0
+        self.italic_depth = 0
+        self.list_stack: list[str] = []
+        self.list_counters: list[int | None] = []
+        self.active_bullet = False
+        self.tag_stack: list[tuple[str, bool, bool]] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        tag = tag.lower()
+        attrs_dict = {k.lower(): (v or '') for k, v in attrs}
+
+        if tag == 'br':
+            self.fragments.append({'break': True})
+            return
+
+        break_before = False
+        if tag in self._heading_tags or tag in self._block_tags or tag in ('ul', 'ol', 'li'):
+            break_before = True
+        if break_before:
+            self.fragments.append({'break': True})
+
+        bold_add = False
+        italic_add = False
+
+        style_bold, style_italic = _style_flags_from_attrs(attrs_dict)
+        if style_bold:
+            bold_add = True
+        if style_italic:
+            italic_add = True
+
+        if tag in ('strong', 'b') or tag in self._heading_tags:
+            bold_add = True
+        if tag in ('em', 'i'):
+            italic_add = True
+
+        if bold_add:
+            self.bold_depth += 1
+        if italic_add:
+            self.italic_depth += 1
+
+        self.tag_stack.append((tag, bold_add, italic_add))
+
+        if tag in ('ul', 'ol'):
+            self.list_stack.append(tag)
+            self.list_counters.append(1 if tag == 'ol' else None)
+            return
+        if tag == 'li':
+            bullet = '• '
+            if self.list_stack and self.list_stack[-1] == 'ol':
+                counter = self.list_counters[-1] or 1
+                bullet = f"{counter}. "
+                self.list_counters[-1] = counter + 1
+            self.fragments.append({
+                'text': bullet,
+                'bold': self.bold_depth > 0,
+                'italic': self.italic_depth > 0,
+                'bullet': True,
+            })
+            self.active_bullet = True
+            return
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        tag = tag.lower()
+        while self.tag_stack:
+            stack_tag, had_bold, had_italic = self.tag_stack.pop()
+            if had_bold:
+                self.bold_depth = max(0, self.bold_depth - 1)
+            if had_italic:
+                self.italic_depth = max(0, self.italic_depth - 1)
+            if stack_tag == tag:
+                break
+
+        if tag in self._heading_tags or tag in self._block_tags or tag == 'li' or tag in ('ul', 'ol'):
+            self.fragments.append({'break': True})
+
+        if tag == 'li':
+            self.active_bullet = False
+        if tag in ('ul', 'ol'):
+            if self.list_stack:
+                self.list_stack.pop()
+            if self.list_counters:
+                self.list_counters.pop()
+            self.active_bullet = False
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if not data:
+            return
+        text = data.replace('\r', '').replace('\xa0', ' ')
+        if not text.strip():
+            if '\n' in text:
+                self.fragments.append({'break': True})
+            return
+        leading_space = text[0].isspace()
+        trailing_space = text[-1].isspace()
+        text = text.replace('\n', ' ')
+        text = re.sub(r'\s+', ' ', text)
+        if leading_space and not text.startswith(' '):
+            text = ' ' + text
+        if trailing_space and not text.endswith(' '):
+            text = text + ' '
+        self.fragments.append({
+            'text': text,
+            'bold': self.bold_depth > 0,
+            'italic': self.italic_depth > 0,
+            'bullet': self.active_bullet,
+        })
+
+    def get_fragments(self) -> list[dict[str, object]]:
+        merged: list[dict[str, object]] = []
+        break_streak = 0
+        for fragment in self.fragments:
+            if fragment.get('break'):
+                if break_streak < 2:
+                    merged.append({'break': True})
+                break_streak = min(2, break_streak + 1)
+                continue
+            text = str(fragment.get('text', ''))
+            if not text:
+                continue
+            break_streak = 0
+            bold = bool(fragment.get('bold'))
+            italic = bool(fragment.get('italic'))
+            bullet = bool(fragment.get('bullet'))
+            if merged and not merged[-1].get('break'):
+                prev = merged[-1]
+                if prev.get('bold') == bold and prev.get('italic') == italic and prev.get('bullet') == bullet:
+                    prev['text'] = str(prev.get('text', '')) + text
+                    continue
+            merged.append({'text': text, 'bold': bold, 'italic': italic, 'bullet': bullet})
+        return merged
+
+
+def _encode_latin1(text: str) -> str:
+    return text.encode('latin-1', errors='replace').decode('latin-1')
+
 
 def fallback_html_to_pdf(html_content: str, output_path: str) -> bool:
-    """Fallback PDF generation using FPDF for basic text content."""
+    """Fallback PDF generation using FPDF with basic formatting support."""
     try:
-        import re
-        from html import unescape
-
-        # Strip HTML tags and convert to plain text
-        text_content = re.sub(r'<[^>]+>', '', html_content)
-        text_content = unescape(text_content)
+        parser = _FPDFHTMLParser()
+        parser.feed(html_content or '')
+        parser.close()
+        fragments = parser.get_fragments()
 
         pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
         pdf.set_font('Arial', size=12)
 
-        lines = text_content.split('\n')
-        for line in lines:
-            # Wrap long lines to avoid overflow
-            if len(line) > 80:
-                words = line.split(' ')
-                current_line = ''
-                for word in words:
-                    if len(current_line + word) > 80:
-                        if current_line:
-                            pdf.cell(0, 10, current_line.encode('latin1', errors='replace').decode('latin1'), ln=True)
-                        current_line = word + ' '
-                    else:
-                        current_line += word + ' '
-                if current_line:
-                    pdf.cell(0, 10, current_line.encode('latin1', errors='replace').decode('latin1'), ln=True)
-            else:
-                pdf.cell(0, 10, line.encode('latin1', errors='replace').decode('latin1'), ln=True)
+        line_height = 6
+        current_style = ''
+        line_started = False
+
+        for fragment in fragments:
+            if fragment.get('break'):
+                pdf.ln(line_height)
+                line_started = False
+                continue
+
+            text = str(fragment.get('text', ''))
+            if not text:
+                continue
+
+            style = ''
+            if fragment.get('bold'):
+                style += 'B'
+            if fragment.get('italic'):
+                style += 'I'
+            if style != current_style:
+                pdf.set_font('Arial', style=style, size=12)
+                current_style = style
+
+            if not line_started:
+                if fragment.get('bullet'):
+                    pdf.set_x(pdf.l_margin + 4)
+                else:
+                    pdf.set_x(pdf.l_margin)
+                line_started = True
+
+            sanitized = _encode_latin1(text)
+            pdf.write(line_height, sanitized)
+
+        if not fragments:
+            pdf.multi_cell(0, line_height, '')
 
         pdf.output(output_path)
         logger.info(f"Successfully generated PDF using fpdf fallback: {output_path}")
