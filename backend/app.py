@@ -619,18 +619,41 @@ class EMLToPDFConverter:
                         vertical-align: -0.1em;
                     }}
                     .email-header {{
-                        background: #f5f5f5;
-                        padding: 15px;
-                        margin-bottom: 20px;
-                        border-left: 4px solid #007cba;
+                        margin-bottom: 24px;
+                        color: #202124;
+                        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
                     }}
-                    .email-header h2 {{
-                        margin: 0 0 10px 0;
-                        color: #007cba;
+                    .email-header .email-header-table {{
+                        width: 100%;
+                        border-collapse: collapse;
                     }}
-                    .email-meta {{
-                        font-size: 0.9em;
-                        color: #666;
+                    .email-header .email-header-row td {{
+                        padding: 0;
+                        vertical-align: top;
+                    }}
+                    .email-header .email-header-label {{
+                        font-size: 11px;
+                        font-weight: 600;
+                        text-transform: uppercase;
+                        letter-spacing: 0.08em;
+                        color: #5f6368;
+                        padding-right: 20px;
+                        white-space: nowrap;
+                    }}
+                    .email-header .email-header-value {{
+                        font-size: 13px;
+                        line-height: 1.5;
+                    }}
+                    .email-header .subject-row td {{
+                        padding-bottom: 12px;
+                    }}
+                    .email-header .subject-row .email-header-value {{
+                        font-size: 18px;
+                        font-weight: 600;
+                        line-height: 1.3;
+                    }}
+                    .email-header .email-header-row + .email-header-row td {{
+                        padding-top: 6px;
                     }}
                     .content {{
                         max-width: 100%;
@@ -650,12 +673,26 @@ class EMLToPDFConverter:
             </head>
             <body>
                 <div class="email-header">
-                    <h2>{html.escape(subject)}</h2>
-                    <div class="email-meta">
-                        <strong>From:</strong> {html.escape(sender)}<br>
-                        <strong>To:</strong> {html.escape(recipient)}<br>
-                        <strong>Date:</strong> {html.escape(date_display)}
-                    </div>
+                    <table class="email-header-table">
+                        <tbody>
+                            <tr class="email-header-row subject-row">
+                                <td class="email-header-label">Subject:</td>
+                                <td class="email-header-value">{html.escape(subject)}</td>
+                            </tr>
+                            <tr class="email-header-row">
+                                <td class="email-header-label">From:</td>
+                                <td class="email-header-value">{html.escape(sender)}</td>
+                            </tr>
+                            <tr class="email-header-row">
+                                <td class="email-header-label">To:</td>
+                                <td class="email-header-value">{html.escape(recipient)}</td>
+                            </tr>
+                            <tr class="email-header-row">
+                                <td class="email-header-label">Date:</td>
+                                <td class="email-header-value">{html.escape(date_display)}</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
                 <div class="content">
                     {body}
