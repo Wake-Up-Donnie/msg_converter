@@ -1115,14 +1115,30 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
                 }}
                 .email-header {{
-                    background-color: #f5f5f5;
-                    padding: 10px;
                     margin-bottom: 20px;
-                    border-left: 4px solid #007cba;
+                    padding: 0;
+                    font-size: 13px;
+                    line-height: 1.45;
+                    color: #1f1f1f;
                 }}
                 .email-body {{ padding: 10px; }}
-                .header-item {{ margin-bottom: 5px; }}
-                .label {{ font-weight: bold; }}
+                .header-item {{
+                    display: flex;
+                    align-items: baseline;
+                    gap: 8px;
+                    margin: 0 0 6px;
+                }}
+                .header-item:last-child {{
+                    margin-bottom: 0;
+                }}
+                .label {{
+                    font-weight: 600;
+                    color: #444;
+                    min-width: 64px;
+                }}
+                .value {{
+                    flex: 1;
+                }}
                 img {{
                     max-width: 100%;
                     height: auto;
@@ -1141,10 +1157,10 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         </head>
         <body>
             <div class="email-header">
-                <div class="header-item"><span class="label">From:</span> {html.escape(sender)}</div>
-                <div class="header-item"><span class="label">To:</span> {html.escape(recipient)}</div>
-                <div class="header-item"><span class="label">Subject:</span> {html.escape(subject)}</div>
-                <div class="header-item"><span class="label">Date:</span> {html.escape(date_display)}</div>
+                <div class="header-item"><span class="label">From:</span><span class="value">{html.escape(sender)}</span></div>
+                <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient)}</span></div>
+                <div class="header-item"><span class="label">Subject:</span><span class="value">{html.escape(subject)}</span></div>
+                <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
             </div>
             <div class="email-body wrap">
                 {body}{attachment_inline_note}
