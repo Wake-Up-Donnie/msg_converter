@@ -288,6 +288,23 @@ curl -F "files=@/absolute/path/to/email.eml" http://localhost:5002/convert | jq
 - Ensure Chromium layer is properly packaged
 - Check Lambda function size limits
 
+## Tests
+
+### PDF layout regression
+
+Run the regression check to ensure the sample `.msg` file still renders with the expected header and body layout. The test converts the message using the Playwright pipeline and compares each rendered PDF page against the base64-encoded reference in `correct_pdf_output_format/correct-format.b64`.
+
+```bash
+# Install Playwright browsers if you haven't already
+python -m playwright install chromium
+playwright install-deps  # required on fresh environments
+
+# Execute the regression check
+python old_tests/test_pdf_layout_regression.py
+```
+
+Use this test after modifying rendering code to catch regressions in the PDF layout.
+
 ## Contributing
 
 1. Fork the repository
