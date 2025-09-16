@@ -1216,13 +1216,25 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         subject = _safe_decode_header(msg.get('Subject', 'No Subject'))
         sender_decoded = _safe_decode_header(msg.get('From', 'Unknown Sender'))
         recipient_decoded = _safe_decode_header(msg.get('To', 'Unknown Recipient'))
+        cc_decoded = _safe_decode_header(msg.get('Cc', ''))
         sender = _format_address_header(sender_decoded)
         recipient = _format_address_header(recipient_decoded)
         recipient_compact = _format_address_header_compact(recipient_decoded)
         recipient_display = recipient_compact or recipient
         sender_value_html = _build_sender_value_html(sender_decoded)
         date_display = _extract_display_date(msg)
-        logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}'")
+        
+        # Process CC field if present
+        cc_display = ""
+        cc_html = ""
+        if cc_decoded and cc_decoded.strip():
+            cc_formatted = _format_address_header(cc_decoded)
+            cc_compact = _format_address_header_compact(cc_decoded)
+            cc_display = cc_compact or cc_formatted
+            cc_html = f'<div class="header-item"><span class="label">Cc:</span><span class="value">{html.escape(cc_display)}</span></div>'
+            logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Cc='{cc_display}', Date='{date_display}'")
+        else:
+            logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}' (No CC)")
 
         # Debug: Check if the EML has multipart structure
         logger.info(f"DEBUGGING: EML is_multipart: {msg.is_multipart()}")
@@ -1356,6 +1368,26 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 combined_styles = "\n".join(unique_styles)
                 additional_style_markup = "\n" + textwrap.indent(combined_styles, "            ") + "\n"
 
+        # DIAGNOSTIC: Analyze body content for Word HTML artifacts and size
+        word_html_detected = False
+        body_size_analysis = {}
+        try:
+            if body and ('xmlns:w="urn:schemas-microsoft-com:office:word"' in body or 'Microsoft Word' in body):
+                word_html_detected = True
+                logger.info("PAGE BREAK DIAGNOSTIC: Microsoft Word HTML detected - aggressive cleanup needed")
+            
+            # Analyze body content size and structure
+            if body:
+                body_size_analysis = {
+                    'total_chars': len(body),
+                    'line_breaks': body.count('<br>') + body.count('<p>'),
+                    'divs': body.count('<div>'),
+                    'word_styles': body.count('mso-') if 'mso-' in body else 0
+                }
+                logger.info(f"PAGE BREAK DIAGNOSTIC: Body analysis: {body_size_analysis}")
+        except Exception as diag_e:
+            logger.warning(f"Body analysis failed: {diag_e}")
+
         # Create HTML content (emoji-capable fonts and image styling)
         logger.info("Creating HTML content for PDF generation...")
         html_content = f"""
@@ -1367,7 +1399,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             <style>
                 body {{
                     font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                    line-height: 1.35;
+                    line-height: 1.2; /* Reduced from 1.35 to prevent overflow */
                     margin: 0;
                     padding: 0;
                     color: #333;
@@ -1393,11 +1425,28 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 ul, ol {{ margin: 0 0 10px 20px; padding-left: 18px; }}
                 /* CRITICAL: Ensure email header is NOT affected by email-body overrides */
                 .email-header {{
-                    margin: 0 0 15px 0; /* Increased bottom margin to fix spacing */
+                    margin: 0 0 2px 0; /* Minimal margin */
                     padding: 0;
-                    font-size: 11px;
-                    line-height: 1.25;
+                    font-size: 10px; /* Reduced font size */
+                    line-height: 1.15; /* Tighter line height */
                     color: #1f1f1f;
+                    page-break-after: avoid !important; /* Prevent page break after header */
+                    break-after: avoid !important; /* Modern CSS for avoiding breaks */
+                    display: block !important;
+                }}
+                table {{
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    border-collapse: collapse !important;
+                    page-break-inside: auto !important;
+                    break-inside: auto !important;
+                }}
+                td {{
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    vertical-align: top !important;
+                    page-break-inside: avoid !important;
+                    break-inside: avoid !important;
                 }}
                 .email-header .header-item {{
                     margin: 0;
@@ -1424,7 +1473,17 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     font-weight: 600 !important; /* Make bold more explicit */
                 }}
                 .email-body {{
-                    padding: 0 10px 10px 0;
+                    padding: 0 !important;
+                    margin: 0 !important;
+                    display: block !important;
+                    page-break-before: avoid !important; /* Prevent page break before content */
+                    break-before: avoid !important; /* Modern CSS for avoiding breaks */
+                    page-break-inside: auto !important; /* Allow breaks inside if needed */
+                    break-inside: auto !important;
+                    /* Force inline flow to prevent block breaks */
+                    float: none !important;
+                    clear: none !important;
+                    position: static !important;
                 }}
                 .email-body, .email-body * {{
                     /* Forcefully override justification from email inline styles */
@@ -1434,6 +1493,43 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     letter-spacing: normal !important;
                     word-spacing: normal !important;
                     text-align-last: left !important;
+                    /* CRITICAL: Override Microsoft Word spacing */
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                    page-break-after: auto !important;
+                    break-after: auto !important;
+                    /* Override any Word HTML layout properties */
+                    float: none !important;
+                    clear: none !important;
+                    position: static !important;
+                    width: auto !important;
+                    height: auto !important;
+                    max-width: none !important;
+                    max-height: none !important;
+                    min-width: 0 !important;
+                    min-height: 0 !important;
+                }}
+                /* Ultra-aggressive Microsoft Word HTML cleanup */
+                .email-body p {{
+                    margin: 0 0 4px 0 !important;
+                    padding: 0 !important;
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                }}
+                .email-body div {{
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                }}
+                /* Remove any Word-specific page break styles */
+                [style*="page-break"], [style*="break-before"], [style*="break-after"] {{
+                    page-break-before: avoid !important;
+                    page-break-after: auto !important;
+                    break-before: avoid !important;
+                    break-after: auto !important;
                 }}
                 .email-body b, .email-body strong {{ font-weight: 700; }}
                 [style*="text-align:justify"], [style*="text-align: justify"] {{
@@ -1461,16 +1557,23 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 }}
             </style>{additional_style_markup}
         </head>
-        <body>
-            <div class="email-header">
-                <div class="header-item header-from"><span class="label">From:</span><span class="value from-value">{sender_value_html}</span></div>
-                <div class="header-item"><span class="label">Subject:</span><span class="value subject-value">{html.escape(subject)}</span></div>
-                <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
-                <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient_display)}</span></div>
-            </div>
-            <div class="email-body wrap">
-                {body}{attachment_inline_note}
-            </div>
+        <body style="margin:0;padding:0;">
+            <table style="width:100%;border-collapse:collapse;margin:0;padding:0;">
+                <tr>
+                    <td style="margin:0;padding:0;vertical-align:top;">
+                        <div class="email-header">
+                            <div class="header-item header-from"><span class="label">From:</span><span class="value from-value">{sender_value_html}</span></div>
+                            <div class="header-item"><span class="label">Subject:</span><span class="value subject-value">{html.escape(subject)}</span></div>
+                            <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
+                            <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient_display)}</span></div>
+                            {cc_html}
+                        </div>
+                        <div class="email-body">
+                            {body}{attachment_inline_note}
+                        </div>
+                    </td>
+                </tr>
+            </table>
         </body>
         </html>
         """
@@ -1486,6 +1589,11 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             logger.info(f"HEADER DIAGNOSTIC: font-weight declarations in CSS: {font_weight_count}")
             logger.info(f"HEADER DIAGNOSTIC: label class elements: {label_class_count}")
             logger.info(f"HEADER DIAGNOSTIC: Header HTML structure: {header_section[:500]}...")
+            logger.info(f"HEADER DIAGNOSTIC: CC field present: {bool(cc_html)}")
+            logger.info(f"HEADER DIAGNOSTIC: Page break prevention CSS added")
+            logger.info(f"PAGE BREAK DIAGNOSTIC: Word HTML detected: {word_html_detected}")
+            logger.info(f"PAGE BREAK DIAGNOSTIC: Body size: {body_size_analysis}")
+            logger.info(f"PAGE BREAK DIAGNOSTIC: Reduced margins and aggressive Word cleanup applied")
             
             # Check for CSS conflicts
             if '.email-body *' in html_content and 'font-weight' in html_content:
@@ -1893,10 +2001,39 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
                 pdf_start = time.time()
                 logger.info(f"Starting PDF generation to: {output_path}")
                 page_format, page_margins = _resolve_pdf_layout_settings()
+                # Use minimal margins for better content flow
+                pdf_margins = page_margins.copy()
+                pdf_margins['top'] = '0.3in'  # Further reduced
+                pdf_margins['bottom'] = '0.3in'  # Further reduced
+                pdf_margins['left'] = '0.5in'  # Slightly reduced
+                pdf_margins['right'] = '0.5in'  # Slightly reduced
+                
+                logger.info(f"PAGE BREAK DIAGNOSTIC: Using minimal PDF margins: {pdf_margins}")
+                
+                # Add page evaluation for debugging
+                try:
+                    page_info = page.evaluate("""
+                        () => {
+                            const header = document.querySelector('.email-header');
+                            const body = document.querySelector('.email-body');
+                            return {
+                                headerHeight: header ? header.offsetHeight : 0,
+                                bodyHeight: body ? body.offsetHeight : 0,
+                                totalHeight: document.body.scrollHeight,
+                                viewportHeight: window.innerHeight,
+                                headerDisplay: header ? window.getComputedStyle(header).display : 'none',
+                                bodyDisplay: body ? window.getComputedStyle(body).display : 'none'
+                            };
+                        }
+                    """)
+                    logger.info(f"PAGE BREAK DIAGNOSTIC: Page layout info: {page_info}")
+                except Exception as eval_e:
+                    logger.warning(f"Page evaluation failed: {eval_e}")
+                
                 page.pdf(
                     path=output_path,
                     format=page_format,
-                    margin=page_margins,
+                    margin=pdf_margins,
                     print_background=True,
                     prefer_css_page_size=False,
                     display_header_footer=False
