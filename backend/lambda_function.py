@@ -11,17 +11,29 @@ from email.policy import default
 from email.header import decode_header
 from email.message import EmailMessage
 from email.generator import BytesGenerator
-from email.utils import parseaddr, parsedate_to_datetime, format_datetime
+from email.utils import parseaddr, parsedate_to_datetime, format_datetime, formataddr, getaddresses
 from datetime import datetime, timezone
 import io
 import html
 import re
+import textwrap
 from playwright.sync_api import sync_playwright
 from fpdf import FPDF
 from pypdf import PdfReader, PdfWriter
 import shutil
 import subprocess
 from pathlib import Path
+
+try:
+    from .playwright_install import (
+        ensure_playwright_browsers_installed,
+        is_missing_browser_error,
+    )
+except ImportError:  # pragma: no cover - fallback when executed as script
+    from playwright_install import (  # type: ignore
+        ensure_playwright_browsers_installed,
+        is_missing_browser_error,
+    )
 from converter import EmailConverter
 from router import LambdaRouter
 from document_converter import DocumentConverter
@@ -68,6 +80,107 @@ logger.debug("Logging configured: level=%s, handlers=%s", logging.getLevelName(l
 converter = EmailConverter(logger)
 doc_converter = DocumentConverter(logger)
 multipart_parser = MultipartParser(logger)
+
+EMAIL_PDF_BASE_CSS = textwrap.dedent(
+    """
+    body {
+        margin: 0;
+        padding: 0;
+        background-color: #ffffff;
+        color: #111827;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+    }
+    .pdf-wrapper {
+        box-sizing: border-box;
+    }
+    .message-header {
+        border-bottom: 1px solid #e5e7eb;
+        padding-bottom: 18px;
+        margin-bottom: 24px;
+    }
+    .subject-line {
+        font-size: 20px;
+        font-weight: 600;
+        color: #111827;
+        margin-bottom: 16px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+    .subject-label {
+        color: #6b7280;
+        font-weight: 600;
+    }
+    .subject-value {
+        color: #111827;
+        font-weight: 600;
+    }
+    .meta-grid {
+        display: grid;
+        grid-template-columns: 120px 1fr;
+        row-gap: 8px;
+        column-gap: 16px;
+        font-size: 13px;
+    }
+    .meta-label {
+        font-weight: 600;
+        color: #374151;
+        white-space: nowrap;
+    }
+    .meta-value {
+        color: #111827;
+        line-height: 1.5;
+        white-space: pre-line;
+        word-break: break-word;
+    }
+    .meta-value a {
+        color: #2563eb;
+        text-decoration: none;
+    }
+    .meta-value a:hover {
+        text-decoration: underline;
+    }
+    .message-body {
+        font-size: 13px;
+        line-height: 1.6;
+        color: #111827;
+    }
+    .message-body * {
+        max-width: 100%;
+        box-sizing: border-box;
+    }
+    .message-body img {
+        max-width: 100%;
+        height: auto;
+        display: block;
+        margin: 12px 0;
+    }
+    .message-body table {
+        border-collapse: collapse;
+        max-width: 100%;
+    }
+    .message-body table td,
+    .message-body table th {
+        vertical-align: top;
+        word-break: break-word;
+    }
+    .attachment-note {
+        margin-top: 24px;
+        padding: 12px 16px;
+        border-left: 3px solid #9ca3af;
+        background-color: #f9fafb;
+        font-size: 12px;
+        color: #4b5563;
+    }
+    img.emoji,
+    svg.emoji {
+        display: inline-block;
+        width: 1em;
+        height: 1em;
+        vertical-align: -0.15em;
+    }
+    """
+).strip()
 
 
 def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
@@ -143,12 +256,49 @@ def get_part_content(part):
 def clean_html_content(html_content: str) -> str:
     """Basic HTML sanitation and cleanup."""
     try:
-        html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-        html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-        html_content = re.sub(r'\s*on\w+\s*=\s*["\'][^"\']*["\']', '', html_content, flags=re.IGNORECASE)
+        html_content = re.sub(
+            r'<script[^>]*>.*?</script>',
+            '',
+            html_content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        def _sanitize_style(match):
+            attrs = match.group(1) or ''
+            css = match.group(2) or ''
+            css = re.sub(r'(?i)@import[^;]*;?', '', css)
+            css = re.sub(r'(?i)expression\s*\([^)]*\)', '', css)
+            cleaned = css.strip()
+            if not cleaned:
+                return ''
+            return f"<style{attrs}>{cleaned}</style>"
+
+        html_content = re.sub(
+            r'<style([^>]*)>(.*?)</style>',
+            _sanitize_style,
+            html_content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        html_content = re.sub(
+            r'\s*on\w+\s*=\s*["\'][^"\']*["\']',
+            '',
+            html_content,
+            flags=re.IGNORECASE,
+        )
         html_content = re.sub(r'\s*javascript\s*:', '', html_content, flags=re.IGNORECASE)
-        html_content = re.sub(r'<o:p[^>]*>.*?</o:p>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-        html_content = re.sub(r'<!\[if[^>]*>.*?<!\[endif\]>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+        html_content = re.sub(
+            r'<o:p[^>]*>.*?</o:p>',
+            '',
+            html_content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        html_content = re.sub(
+            r'<!\[if[^>]*>.*?<!\[endif\]>',
+            '',
+            html_content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         return html_content
     except Exception as e:
         logger.warning(f"Error cleaning HTML content: {str(e)}")
@@ -183,6 +333,95 @@ def normalize_whitespace(html_content: str) -> str:
     
     # Trim leading/trailing whitespace from the entire block
     return content.strip()
+
+
+def separate_inline_styles(html_fragment: str) -> tuple[str, list[str]]:
+    """Extract <style> blocks from a fragment and strip outer <html>/<body> wrappers."""
+    if not html_fragment:
+        return html_fragment, []
+
+    style_blocks = []
+
+    try:
+        def _capture(match):
+            attrs = match.group(1) or ''
+            css = match.group(2) or ''
+            block = f"<style{attrs}>{css}</style>"
+            style_blocks.append(block)
+            return ''
+
+        without_styles = re.sub(
+            r'<style([^>]*)>(.*?)</style>',
+            _capture,
+            html_fragment,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        without_head = re.sub(
+            r'<head[^>]*>.*?</head>',
+            '',
+            without_styles,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        body_match = re.search(
+            r'<body[^>]*>(.*?)</body>',
+            without_head,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if body_match:
+            cleaned = body_match.group(1)
+        else:
+            cleaned = without_head
+
+        cleaned = re.sub(r'</?html[^>]*>', '', cleaned, flags=re.IGNORECASE)
+        return cleaned, style_blocks
+    except Exception as exc:
+        logger.warning(f"Failed to isolate inline styles: {exc}")
+        return html_fragment, style_blocks
+
+
+def format_address_field(header_values) -> str:
+    """Render an address header value as HTML-safe text separated by <br> tags."""
+    try:
+        if not header_values:
+            return "—"
+
+        if isinstance(header_values, str):
+            values = [header_values]
+        else:
+            values = [v for v in header_values if v]
+
+        if not values:
+            return "—"
+
+        addresses = getaddresses(values)
+        rendered = []
+        for name, addr in addresses:
+            name = (name or '').strip()
+            addr = (addr or '').strip()
+            if not name and not addr:
+                continue
+            display = formataddr((name, addr)) if addr else name
+            display = display.strip()
+            if display:
+                rendered.append(html.escape(display))
+
+        if rendered:
+            return '<br>'.join(rendered)
+
+        fallback = ', '.join(values).strip()
+        return html.escape(fallback) if fallback else "—"
+    except Exception as exc:
+        logger.warning(f"Failed to format address field: {exc}")
+        try:
+            if isinstance(header_values, str):
+                fallback = header_values
+            else:
+                fallback = ', '.join([v for v in (header_values or []) if v])
+        except Exception:
+            fallback = ''
+        return html.escape(fallback) if fallback else "—"
 
 
 # --- Helper: normalize image lookup keys (NFKC, strip zero-width, collapse spaces) ---
@@ -699,9 +938,13 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
 
     body = None
     logger.info(f"DEBUGGING: Body selection - HTML candidates: {len(html_candidates)}, Text candidates: {len(text_candidates)}")
-    
+
+    if html_candidates:
+        body = max(html_candidates, key=lambda t: t[0])[1]
+        logger.info(f"DEBUGGING: Selected HTML body with {len(body)} chars")
+
     # CRITICAL FIX: Analyze text parts to avoid duplication with embedded attachments
-    if len(text_candidates) > 1:
+    elif len(text_candidates) > 1:
         logger.info(f"DEBUGGING: Multiple text parts detected - analyzing for forwarded content")
         
         # Check if there are embedded message attachments that might duplicate forwarded content
@@ -763,9 +1006,6 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
     elif text_candidates:
         body = max(text_candidates, key=lambda t: t[0])[1]
         logger.info(f"DEBUGGING: Selected single text body with {len(body)} chars")
-    elif html_candidates:
-        body = max(html_candidates, key=lambda t: t[0])[1]
-        logger.info(f"DEBUGGING: Selected HTML body with {len(body)} chars")
     
     if not body:
         body = "No content available"
@@ -806,12 +1046,18 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
 
     if images and body:
         body = replace_image_references(body, {k: v for k, v in images.items() if not str(k).startswith('__unref__:')})
-    
+
+    inline_styles = []
+    if body:
+        body, inline_styles = separate_inline_styles(body)
+
     # Normalize whitespace in the final body
     body = normalize_whitespace(body)
 
-    logger.info(f"Parsed email: body_len={len(body) if body else 0}, images_inlined={sum(1 for k in images.keys() if not str(k).startswith('__unref__:'))}")
-    return body, images, attachments
+    logger.info(
+        f"Parsed email: body_len={len(body) if body else 0}, images_inlined={sum(1 for k in images.keys() if not str(k).startswith('__unref__:'))}"
+    )
+    return body, images, attachments, inline_styles
 
 def _safe_decode_header(value) -> str:
     """Decode RFC 2047/2231 encoded header values to a readable string."""
@@ -911,9 +1157,12 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
 
         # Rich extraction: body + inline images
         logger.info("Extracting email body + inline images...")
+        inline_styles = []
         try:
-            body, images, attachments = extract_body_and_images_from_email(msg, msg_attachments)
-            logger.info(f"DEBUGGING: Rich extraction completed - body_len={len(body)}, images={len(images)}, attachments={len(attachments)}")
+            body, images, attachments, inline_styles = extract_body_and_images_from_email(msg, msg_attachments)
+            logger.info(
+                f"DEBUGGING: Rich extraction completed - body_len={len(body)}, images={len(images)}, attachments={len(attachments)}, styles={len(inline_styles)}"
+            )
         except Exception as e:
             logger.error(f"Rich extraction failed: {e}")
             logger.info(f"DEBUGGING: Falling back to simple extraction")
@@ -942,6 +1191,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 if msg.get_content_type() == "text/plain":
                     body = body.replace('\n', '<br>')
                 logger.info(f"DEBUGGING: Fallback single part body: {len(body)} chars")
+            body, inline_styles = separate_inline_styles(body)
             body = normalize_whitespace(body)
         logger.info(f"Body extracted. Length={len(body)}")
         
@@ -950,130 +1200,157 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             logger.info(f"DEBUGGING: Body content preview: {body[:300]}...")
         else:
             logger.warning(f"DEBUGGING: Body content is EMPTY!")
-        # Strip outer HTML tags if body is a full HTML document to preserve layout
-        try:
-            if re.search(r"<\s*html", body, re.IGNORECASE):
-                match = re.search(r"<\s*body[^>]*>(.*)</\s*body\s*>", body, flags=re.IGNORECASE | re.DOTALL)
-                if match:
-                    body = match.group(1)
-                else:
-                    body = re.sub(r"</?html[^>]*>", "", body, flags=re.IGNORECASE)
-                    body = re.sub(r"</?body[^>]*>", "", body, flags=re.IGNORECASE)
-                logger.info("Stripped outer HTML tags from body")
-        except Exception as e:
-            logger.warning(f"Failed to strip outer HTML tags: {e}")
         # Prepare optional inline attachment note (avoid automated-looking header pages in final PDF)
         try:
             _pdf_att_meta = [
                 a for a in (attachments or [])
-                if a.get('content_type') == 'application/pdf' or str(a.get('filename','')).lower().endswith('.pdf')
+                if a.get('content_type') == 'application/pdf' or str(a.get('filename', '')).lower().endswith('.pdf')
             ]
         except Exception:
             _pdf_att_meta = []
+
         attachment_inline_note = ""
-        if _pdf_att_meta and str(os.environ.get('ATTACHMENT_INLINE_NOTE','')).lower() in ("1","true","yes","on"):
+        if _pdf_att_meta and str(os.environ.get('ATTACHMENT_INLINE_NOTE', '')).lower() in ("1", "true", "yes", "on"):
             try:
-                names = ", ".join(html.escape(a.get('filename') or f'attachment-{i+1}.pdf') for i,a in enumerate(_pdf_att_meta))
+                names = ", ".join(
+                    html.escape(a.get('filename') or f'attachment-{i+1}.pdf')
+                    for i, a in enumerate(_pdf_att_meta)
+                )
                 plural = 's' if len(_pdf_att_meta) != 1 else ''
-                attachment_inline_note = f"""
-                <div style=\"margin-top:24px; padding:10px 12px; background:#fafafa; border-left:3px solid #d0d0d0; font-size:11pt; color:#555;\">
-                    Attached PDF{plural}: {names}
-                </div>
-                """
+                attachment_inline_note = f"<div class=\"attachment-note\">Attached PDF{plural}: {names}</div>"
             except Exception as _e:
                 logger.warning(f"Failed building attachment inline note: {_e}")
                 attachment_inline_note = ""
 
-        # Create HTML content (emoji-capable fonts and image styling)
         logger.info("Creating HTML content for PDF generation...")
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <title>{html.escape(subject)}</title>
-            <style>
-                body {{
-                    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                    line-height: 1.35;
-                    margin: 20px;
-                    color: #333;
-                    word-wrap: break-word;
-                    /* --- FIX FOR WORD SPACING --- */
-                    text-align: left; /* Default alignment */
-                    text-justify: auto;
-                    letter-spacing: normal;
-                    word-spacing: normal;
-                    white-space: normal;
-                    overflow-wrap: anywhere;
-                    word-break: normal;
-                    -webkit-hyphens: none;
-                    hyphens: none;
-                    -webkit-font-smoothing: antialiased;
-                    -moz-osx-font-smoothing: grayscale;
-                    text-rendering: optimizeLegibility;
-                    font-feature-settings: "kern" 1, "liga" 1;
-                }}
-                p {{ margin: 0 0 8px; }}
-                li {{ margin: 0 0 4px; }}
-                h1, h2, h3, h4, h5, h6 {{ margin: 12px 0 6px; }}
-                ul, ol {{ margin: 0 0 10px 20px; padding-left: 18px; }}
-                .email-body, .email-body * {{
-                    /* Forcefully override justification from email inline styles */
-                    white-space: normal !important; /* Override Outlook's 'pre' on spans */
-                    text-align: left !important;
-                    text-justify: auto !important;
-                    letter-spacing: normal !important;
-                    word-spacing: normal !important;
-                    text-align-last: left !important;
-                }}
-                [style*="text-align:justify"], [style*="text-align: justify"] {{
-                  text-align: left !important;
-                }}
-                pre, code {{
-                    white-space: pre-wrap !important; /* Ensure code blocks are not affected */
-                }}
-                .emoji {{
-                    font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
-                }}
-                .email-header {{
-                    background-color: #f5f5f5;
-                    padding: 10px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #007cba;
-                }}
-                .email-body {{ padding: 10px; }}
-                .header-item {{ margin-bottom: 5px; }}
-                .label {{ font-weight: bold; }}
-                img {{
-                    max-width: 100%;
-                    height: auto;
-                    display: block;
-                    margin: 8px 0;
-                }}
-                .inline-image {{
-                    max-width: 100%;
-                    height: auto;
-                }}
-                pre, code {{
-                    white-space: pre-wrap;
-                    word-break: break-word;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="email-header">
-                <div class="header-item"><span class="label">From:</span> {html.escape(sender)}</div>
-                <div class="header-item"><span class="label">To:</span> {html.escape(recipient)}</div>
-                <div class="header-item"><span class="label">Subject:</span> {html.escape(subject)}</div>
-                <div class="header-item"><span class="label">Date:</span> {html.escape(date_display)}</div>
-            </div>
-            <div class="email-body wrap">
-                {body}{attachment_inline_note}
-            </div>
-        </body>
-        </html>
-        """
+
+        def _preview(text: str, limit: int = 200) -> str:
+            if not text:
+                return ''
+            text = text.strip()
+            if len(text) <= limit:
+                return text
+            return text[:limit] + '...'
+
+        if inline_styles:
+            total_style_chars = sum(len(s) for s in inline_styles)
+            logger.info(
+                "Inline <style> blocks captured for PDF header: %d (total %d chars)",
+                len(inline_styles),
+                total_style_chars,
+            )
+            style_preview = re.sub(r'\s+', ' ', inline_styles[0]).strip()
+            if len(style_preview) > 180:
+                style_preview = style_preview[:177] + '...'
+            logger.info(f"Inline style preview: {style_preview}")
+        else:
+            logger.info("Inline <style> blocks captured for PDF header: 0")
+
+        raw_from = msg.get_all('From', []) or []
+        raw_to = msg.get_all('To', []) or []
+        raw_cc = msg.get_all('Cc', []) or []
+        raw_bcc = msg.get_all('Bcc', []) or []
+        raw_reply_to = msg.get_all('Reply-To', []) or []
+
+        from_addresses = getaddresses(raw_from)
+        to_addresses = getaddresses(raw_to)
+        cc_addresses = getaddresses(raw_cc)
+        bcc_addresses = getaddresses(raw_bcc)
+        reply_to_addresses = getaddresses(raw_reply_to)
+
+        logger.info(
+            "Email header address counts -> from:%d to:%d cc:%d bcc:%d reply_to:%d",
+            len(from_addresses),
+            len(to_addresses),
+            len(cc_addresses),
+            len(bcc_addresses),
+            len(reply_to_addresses),
+        )
+        logger.info("Email subject for PDF header: %s", _preview(subject, 200))
+
+        from_html = format_address_field(raw_from or [sender])
+        to_html = format_address_field(raw_to or [recipient])
+        cc_html = format_address_field(raw_cc)
+        bcc_html = format_address_field(raw_bcc)
+        reply_to_html = format_address_field(raw_reply_to)
+        date_html = html.escape(date_display) if date_display else "—"
+        subject_html = html.escape(subject) if subject else "No Subject"
+
+        attachment_names = []
+        seen_attachment_names = set()
+        for att in attachments or []:
+            name = att.get('filename')
+            if name and name not in seen_attachment_names:
+                seen_attachment_names.add(name)
+                attachment_names.append(name)
+        for att in msg_attachments or []:
+            name = att.get('filename')
+            if name and name not in seen_attachment_names:
+                seen_attachment_names.add(name)
+                attachment_names.append(name)
+
+        if attachment_names:
+            logger.info("Email attachments for header row: %s", _preview(', '.join(attachment_names), 200))
+        else:
+            logger.info("Email attachments for header row: none detected")
+
+        metadata_rows = [
+            ('From', from_html),
+            ('Sent', date_html),
+            ('To', to_html),
+        ]
+        if cc_html != '—':
+            metadata_rows.append(('Cc', cc_html))
+        if bcc_html != '—':
+            metadata_rows.append(('Bcc', bcc_html))
+        if reply_to_html != '—':
+            metadata_rows.append(('Reply-To', reply_to_html))
+        if attachment_names:
+            attachments_html = '<br>'.join(html.escape(name) for name in attachment_names)
+            metadata_rows.append(('Attachments', attachments_html))
+
+        indent = ' ' * 12
+        metadata_lines = []
+        for label, value in metadata_rows:
+            metadata_lines.append(f"{indent}<div class=\"meta-label\">{label}:</div>")
+            metadata_lines.append(f"{indent}<div class=\"meta-value\">{value}</div>")
+        metadata_html = '\n'.join(metadata_lines)
+
+        base_css = textwrap.indent(EMAIL_PDF_BASE_CSS, ' ' * 4)
+        inline_style_section = ''
+        if inline_styles:
+            inline_style_section = '\n' + '\n'.join(textwrap.indent(block, '    ') for block in inline_styles) + '\n'
+
+        body_section = body + attachment_inline_note
+
+        html_content = (
+            f"<!DOCTYPE html>\n"
+            f"<html lang=\"en\">\n"
+            f"<head>\n"
+            f"    <meta charset=\"UTF-8\">\n"
+            f"    <title>{html.escape(subject)}</title>\n"
+            f"    <style>\n"
+            f"{base_css}\n"
+            f"    </style>{inline_style_section}"
+            f"</head>\n"
+            f"<body>\n"
+            f"    <div class=\"pdf-wrapper\">\n"
+            f"        <div class=\"message-header\">\n"
+            f"            <div class=\"subject-line\">\n"
+            f"                <span class=\"subject-label\">Subject:</span>\n"
+            f"                <span class=\"subject-value\">{subject_html}</span>\n"
+            f"            </div>\n"
+            f"            <div class=\"meta-grid\">\n"
+            f"{metadata_html}\n"
+            f"            </div>\n"
+            f"        </div>\n"
+            f"        <div class=\"message-body\">\n"
+            f"            {body_section}\n"
+            f"        </div>\n"
+            f"    </div>\n"
+            f"</body>\n"
+            f"</html>\n"
+        )
         logger.info(f"HTML content created: {len(html_content)} characters")
 
         # Check available /tmp space before creating potentially large PDFs
@@ -1292,6 +1569,7 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
     """Convert HTML to PDF using Playwright (Chromium baked into the image)."""
     max_retries = 3
     twemoji_failed = False
+    install_attempted = False
 
     for attempt in range(max_retries):
         logger.info(f"=== Playwright PDF Generation Attempt {attempt + 1}/{max_retries} ===")
@@ -1402,7 +1680,7 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
 
                               // Now replace all emoji img tags with inline SVGs
                               const emojiImages = Array.from(document.querySelectorAll('img.emoji'));
-                              console.log(`Found ${emojiImages.length} emoji images to inline`);
+                              console.log(`Found ${{emojiImages.length}} emoji images to inline`);
 
                               await Promise.all(emojiImages.map(async (img) => {{
                                 try {{
@@ -1411,7 +1689,7 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
 
                                   const response = await fetch(src, {{ cache: 'force-cache' }});
                                   if (!response.ok) {{
-                                    console.warn(`Failed to fetch ${src}: ${response.status}`);
+                                    console.warn(`Failed to fetch ${{src}}: ${{response.status}}`);
                                     return;
                                   }}
 
@@ -1436,10 +1714,10 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
 
                                     // Replace the img with the inline SVG
                                     img.replaceWith(svgElement);
-                                    console.log(`Inlined emoji SVG: ${src}`);
+                                    console.log(`Inlined emoji SVG: ${{src}}`);
                                   }}
                                 }} catch (error) {{
-                                  console.warn(`Error inlining emoji ${img.src}:`, error);
+                                  console.warn(`Error inlining emoji ${{img.src}}:`, error);
                                 }}
                               }}));
 
@@ -1497,15 +1775,24 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
         except Exception as e:
             logger.error(f"Playwright PDF generation attempt {attempt + 1} failed: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
-            
+
             # Log stack trace for debugging
             import traceback
             logger.error(f"Stack trace: {traceback.format_exc()}")
-            
+
+            if (not install_attempted) and is_missing_browser_error(e):
+                install_attempted = True
+                logger.warning("Playwright browser not found; attempting to install Chromium automatically.")
+                if ensure_playwright_browsers_installed(logger):
+                    logger.info("Playwright Chromium installed successfully; retrying PDF generation.")
+                    continue
+                else:
+                    logger.error("Automatic Playwright installation failed; proceeding with standard retry handling.")
+
             if attempt == max_retries - 1:
                 logger.error(f"=== All Playwright attempts failed after {max_retries} tries ===")
                 raise
-            
+
             retry_delay = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
             logger.info(f"Waiting {retry_delay}s before retry...")
             time.sleep(retry_delay)
