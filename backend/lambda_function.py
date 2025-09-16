@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import io
 import html
 import re
+import textwrap
 from playwright.sync_api import sync_playwright
 from fpdf import FPDF
 from pypdf import PdfReader, PdfWriter
@@ -140,9 +141,17 @@ def get_part_content(part):
             logger.error(f"Failed to extract content with fallback: {str(e2)}")
         return None
 
-def clean_html_content(html_content: str) -> str:
-    """Basic HTML sanitation and cleanup."""
+def clean_html_content(html_content: str, style_collector: list[str] | None = None) -> str:
+    """Basic HTML sanitation and cleanup.
+
+    Optionally collects <style> blocks before they are stripped so the caller can
+    reattach them later in a safe context.
+    """
     try:
+        if style_collector is not None:
+            styles = re.findall(r'<style[^>]*>.*?</style>', html_content, flags=re.DOTALL | re.IGNORECASE)
+            if styles:
+                style_collector.extend(styles)
         html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
         html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
         html_content = re.sub(r'\s*on\w+\s*=\s*["\'][^"\']*["\']', '', html_content, flags=re.IGNORECASE)
@@ -153,6 +162,22 @@ def clean_html_content(html_content: str) -> str:
     except Exception as e:
         logger.warning(f"Error cleaning HTML content: {str(e)}")
         return html.escape(str(html_content)).replace('\n', '<br>\n')
+
+
+def _extract_style_blocks(html_content: str | None) -> tuple[str, list[str]]:
+    """Return HTML content without <style> tags and a list of the extracted blocks."""
+    if not html_content:
+        return html_content or "", []
+
+    try:
+        styles = re.findall(r'<style[^>]*>.*?</style>', html_content, flags=re.DOTALL | re.IGNORECASE)
+        if not styles:
+            return html_content, []
+        cleaned_html = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+        return cleaned_html, styles
+    except Exception as e:
+        logger.warning(f"Error extracting <style> blocks: {str(e)}")
+        return html_content, []
 
 def normalize_whitespace(html_content: str) -> str:
     """Aggressively normalize whitespace to prevent rendering gaps and fix typography ligatures in URLs/text."""
@@ -462,6 +487,8 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
     attachments = []
     html_candidates = []
     text_candidates = []
+    collected_styles: list[str] = []
+    extract_body_and_images_from_email.last_collected_styles = collected_styles
 
     supported_inline_image_types = {
         'image/png',
@@ -669,7 +696,7 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                 if content:
                     logger.info(f"DEBUGGING: Found HTML part with {len(content)} chars")
                     logger.info(f"DEBUGGING: HTML part preview: {content[:300]}...")
-                    cleaned = clean_html_content(content)
+                    cleaned = clean_html_content(content, style_collector=collected_styles)
                     html_candidates.append((len(cleaned), cleaned))
                 return
 
@@ -797,7 +824,7 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                             if part.get_content_type() == 'text/plain':
                                 body = html.escape(full_content).replace('\n', '<br>\n')
                             else:
-                                body = clean_html_content(full_content)
+                                body = clean_html_content(full_content, style_collector=collected_styles)
                             complete_content_found = True
                             break
             
@@ -806,7 +833,13 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
 
     if images and body:
         body = replace_image_references(body, {k: v for k, v in images.items() if not str(k).startswith('__unref__:')})
-    
+
+    if body:
+        body, inline_styles = _extract_style_blocks(body)
+        if inline_styles:
+            collected_styles.extend(inline_styles)
+            logger.info(f"Captured {len(inline_styles)} <style> block(s) during body extraction")
+
     # Normalize whitespace in the final body
     body = normalize_whitespace(body)
 
@@ -942,7 +975,21 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 if msg.get_content_type() == "text/plain":
                     body = body.replace('\n', '<br>')
                 logger.info(f"DEBUGGING: Fallback single part body: {len(body)} chars")
-            body = normalize_whitespace(body)
+            if body:
+                fallback_styles = []
+                body, fallback_styles = _extract_style_blocks(body)
+                if fallback_styles:
+                    try:
+                        style_holder = getattr(extract_body_and_images_from_email, "last_collected_styles")
+                        if style_holder is None:
+                            style_holder = []
+                            extract_body_and_images_from_email.last_collected_styles = style_holder
+                    except AttributeError:
+                        style_holder = []
+                        extract_body_and_images_from_email.last_collected_styles = style_holder
+                    style_holder.extend(fallback_styles)
+                    logger.info(f"Captured {len(fallback_styles)} <style> block(s) during fallback extraction")
+                body = normalize_whitespace(body)
         logger.info(f"Body extracted. Length={len(body)}")
         
         # Debug: Show body content preview
@@ -950,6 +997,20 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             logger.info(f"DEBUGGING: Body content preview: {body[:300]}...")
         else:
             logger.warning(f"DEBUGGING: Body content is EMPTY!")
+        # Capture <style> blocks before removing wrapping HTML so we can reattach them later
+        if body:
+            body, inline_styles = _extract_style_blocks(body)
+            if inline_styles:
+                try:
+                    style_holder = getattr(extract_body_and_images_from_email, "last_collected_styles")
+                    if style_holder is None:
+                        style_holder = []
+                        extract_body_and_images_from_email.last_collected_styles = style_holder
+                except AttributeError:
+                    style_holder = []
+                    extract_body_and_images_from_email.last_collected_styles = style_holder
+                style_holder.extend(inline_styles)
+                logger.info(f"Captured {len(inline_styles)} <style> block(s) from email body")
         # Strip outer HTML tags if body is a full HTML document to preserve layout
         try:
             if re.search(r"<\s*html", body, re.IGNORECASE):
@@ -983,6 +1044,23 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             except Exception as _e:
                 logger.warning(f"Failed building attachment inline note: {_e}")
                 attachment_inline_note = ""
+
+        original_style_blocks = getattr(extract_body_and_images_from_email, "last_collected_styles", []) or []
+        additional_style_markup = ""
+        if original_style_blocks:
+            unique_styles: list[str] = []
+            seen_styles = set()
+            for block in original_style_blocks:
+                normalized_block = (block or "").strip()
+                if not normalized_block:
+                    continue
+                if normalized_block in seen_styles:
+                    continue
+                seen_styles.add(normalized_block)
+                unique_styles.append(block.strip())
+            if unique_styles:
+                combined_styles = "\n".join(unique_styles)
+                additional_style_markup = "\n" + textwrap.indent(combined_styles, "            ") + "\n"
 
         # Create HTML content (emoji-capable fonts and image styling)
         logger.info("Creating HTML content for PDF generation...")
@@ -1059,7 +1137,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     white-space: pre-wrap;
                     word-break: break-word;
                 }}
-            </style>
+            </style>{additional_style_markup}
         </head>
         <body>
             <div class="email-header">
