@@ -281,6 +281,48 @@ def clean_html_content(html_content: str, style_collector: list[str] | None = No
         html_content = re.sub(r'\s*javascript\s*:', '', html_content, flags=re.IGNORECASE)
         html_content = re.sub(r'<o:p[^>]*>.*?</o:p>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
         html_content = re.sub(r'<!\[if[^>]*>.*?<!\[endif\]>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+
+        page_break_defaults = {
+            'page-break-before': 'auto',
+            'page-break-after': 'auto',
+            'break-before': 'auto',
+            'break-after': 'auto',
+            'page-break-inside': 'avoid',
+            'break-inside': 'avoid',
+        }
+
+        style_attr_pattern = re.compile(
+            r"""(\sstyle\s*=\s*)(?P<quote>["'])(?P<content>.*?)(?P=quote)""",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        inline_page_break_pattern = re.compile(
+            r"""(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside)"""
+            r"""(?P<separator>\s*:\s*)(?P<value>[^;]*)(?P<suffix>;?)""",
+            flags=re.IGNORECASE,
+        )
+
+        def _sanitize_style_content(style_content: str) -> str:
+            def _replace(match: re.Match[str]) -> str:
+                value = match.group('value')
+                if not re.search(r"\balways\b", value, flags=re.IGNORECASE):
+                    return match.group(0)
+                prop_name = match.group('prop').lower()
+                safe_value = page_break_defaults.get(prop_name, 'auto')
+                sanitized_value = re.sub(r"\balways\b", safe_value, value, flags=re.IGNORECASE)
+                return (
+                    f"{match.group('prop')}{match.group('separator')}{sanitized_value}{match.group('suffix')}"
+                )
+
+            return inline_page_break_pattern.sub(_replace, style_content)
+
+        def _sanitize_style_attribute(match):
+            prefix = match.group(1)
+            quote = match.group('quote')
+            content = match.group('content')
+            sanitized_content = _sanitize_style_content(content)
+            return f"{prefix}{quote}{sanitized_content}{quote}"
+
+        html_content = style_attr_pattern.sub(_sanitize_style_attribute, html_content)
         return html_content
     except Exception as e:
         logger.warning(f"Error cleaning HTML content: {str(e)}")
