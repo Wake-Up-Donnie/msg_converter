@@ -1,77 +1,56 @@
-# Lambda Python base (Amazon Linux 2023 / glibc 2.34)
-# NOTE: Build scripts force --platform=linux/amd64 to avoid exec format errors when building on Apple Silicon.
-ARG TARGETARCH
+# Lambda base (Amazon Linux 2023 w/ glibc 2.34)
 FROM public.ecr.aws/lambda/python:3.12
 
-# (TARGETARCH is available for conditional logic if ever needed)
-
-# Faster, repeatable builds
-ENV PIP_NO_CACHE_DIR=1
-
-# Upgrade pip
-RUN pip3 install --upgrade pip
-
-# ---- Python deps ----
-COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip3 install -r /tmp/requirements.txt \
-    && pip3 install playwright==1.54.0
-
-# ---- System deps for headless Chromium on Amazon Linux 2023 ----
-# AL2023 uses dnf/microdnf (not apt). Install the libraries Chromium needs.
-# (Fonts help Playwright render PDFs with text correctly.)
+# ---------- System packages ----------
+# Install the minimal native tooling needed for Perl modules and wkhtmltopdf.
 RUN dnf install -y \
-      atk \
-      at-spi2-atk \
-      at-spi2-core \
-      cups-libs \
-      libdrm \
-      libxcb \
-      libxkbcommon \
-      libX11 \
-      libXcomposite \
-      libXdamage \
-      libXext \
-      libXfixes \
-      libXrandr \
-      mesa-libgbm \
-      pango \
-      cairo \
-      alsa-lib \
-      fontconfig \
-      dejavu-sans-fonts \
-      dejavu-serif-fonts \
-      nspr \
-      nss \
-      nss-util \
-    && dnf clean all && rm -rf /var/cache/dnf
+    perl \
+    make \
+    tar \
+    xz \
+    gzip \
+    curl \
+    wget \
+    fontconfig \
+    freetype \
+    urw-base35-fonts \
+    libX11 \
+    libXext \
+    libXrender \
+    libXrandr \
+    libXcursor \
+    libXfixes \
+    libXdamage \
+    libXcomposite \
+    libXinerama \
+    xorg-x11-fonts-Type1 \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
 
-# Install Twemoji font instead of Noto Color Emoji to avoid spacing issues
-RUN dnf install -y ttf-twemoji || true
-# Fallback: manually install Twemoji if package not available
-RUN mkdir -p /usr/share/fonts && \
-  curl -L -o /usr/share/fonts/ttf-twemoji.ttf \
-    https://github.com/twitter/twemoji/raw/master/assets/fonts/TwitterColorEmoji-SVGinOT.ttf && \
-  fc-cache -f -v
+# ---------- Install Email::Outlook::Message (provides msgconvert) ----------
+# Use cpanminus to pull the module and its pure-Perl dependencies into /opt/perl.
+ENV PERL5LIB=/opt/perl/lib/perl5
+ENV PATH=/opt/perl/bin:$PATH
+RUN curl -L https://cpanmin.us | perl - --notest --local-lib=/opt/perl App::cpanminus \
+ && /opt/perl/bin/cpanm --notest --local-lib=/opt/perl Email::Outlook::Message \
+ && ln -s /opt/perl/bin/msgconvert /usr/local/bin/msgconvert
 
-# ---- Set consistent browser path for Lambda ----
-# Removed Noto Color Emoji fallback install since it causes spacing issues
+# ---------- Install wkhtmltopdf (Lambda-friendly build) ----------
+# 0.12.4 is a commonly used static build that plays nicely in Lambda images
+RUN wget -O /tmp/wkhtml.tgz \
+  https://github.com/wkhtmltopdf/wkhtmltopdf/releases/download/0.12.4/wkhtmltox-0.12.4_linux-generic-amd64.tar.xz \
+ && tar -xJf /tmp/wkhtml.tgz -C /tmp \
+ && mv /tmp/wkhtmltox/bin/wkhtmltoimage /usr/local/bin/ \
+ && mv /tmp/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/ \
+ && chmod +x /usr/local/bin/wkhtmltopdf /usr/local/bin/wkhtmltoimage \
+ && rm -rf /tmp/wkhtml*
 
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+# ---------- Python deps ----------
+COPY backend/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# ---- Bake the Chromium browser into the image ----
-# Do NOT use --with-deps on AL2023; it tries apt-get and fails.
-RUN python -m playwright install chromium
-
-# ---- Copy browsers to Lambda-accessible path and set permissions ----
-RUN mkdir -p /opt/ms-playwright && \
-    cp -r /root/.cache/ms-playwright/* /opt/ms-playwright/ 2>/dev/null || true && \
-    python3 -c "import os; [os.chmod(os.path.join(r,f), 0o755) for r,d,files in os.walk('/opt/ms-playwright') for f in files]; [os.chmod(os.path.join(r,d), 0o755) for r,dirs,f in os.walk('/opt/ms-playwright') for d in dirs]; os.chmod('/opt/ms-playwright', 0o755)" 2>/dev/null || true
-
-# ---- Verify browser installation ----
-RUN python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print('Browser path:', p.chromium.executable_path); p.stop()"
-
-# ---- App code ----
+# ---------- Function code ----------
 COPY backend/ ${LAMBDA_TASK_ROOT}/
 
-# Lambda handler (module.function)
-CMD ["lambda_function.lambda_handler"]
+# Entrypoint
+CMD ["lambda_function.handler"]

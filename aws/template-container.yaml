@@ -6,7 +6,7 @@ Parameters:
   Environment:
     Type: String
     Default: prod
-    AllowedValues: [dev, staging, prod]
+    AllowedValues: [dev, staging, prod, test]
     Description: Environment name for resource naming
 
   AppPassword:
