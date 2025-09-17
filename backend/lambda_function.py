@@ -509,6 +509,76 @@ def _strip_word_section_wrappers(html_fragment: str) -> tuple[str, dict[str, int
     }
 
 
+IMAGE_ATTACHMENT_EXTENSIONS = (
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic', '.heif'
+)
+
+
+def _looks_like_image(content_type: str | None, filename: str | None) -> bool:
+    ctype = (content_type or '').lower()
+    if ctype.startswith('image/'):
+        return True
+    if filename and filename.lower().endswith(IMAGE_ATTACHMENT_EXTENSIONS):
+        return True
+    return False
+
+
+def _convert_image_bytes_to_pdf(image_bytes: bytes, source_name: str | None = None) -> tuple[bytes | None, int]:
+    """Convert raw image bytes into a PDF. Returns (pdf_bytes, page_count)."""
+    if not isinstance(image_bytes, (bytes, bytearray)) or not image_bytes:
+        return None, 0
+
+    try:
+        from PIL import Image, ImageSequence
+    except Exception as import_err:
+        logger.warning(
+            "Image->PDF conversion requires Pillow; skipping %s: %s",
+            source_name or 'image attachment',
+            import_err,
+        )
+        return None, 0
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            frames = []
+            try:
+                iterator = ImageSequence.Iterator(img)
+            except Exception:
+                iterator = [img]
+
+            for frame in iterator:
+                converted = frame.convert('RGB') if frame.mode != 'RGB' else frame.copy()
+                frames.append(converted.copy())
+
+            if not frames:
+                frames.append(img.convert('RGB'))
+
+            buffer = io.BytesIO()
+            first = frames[0]
+            rest = frames[1:]
+            if rest:
+                first.save(buffer, format='PDF', save_all=True, append_images=rest)
+            else:
+                first.save(buffer, format='PDF')
+
+            for f in frames:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+            pdf_data = buffer.getvalue()
+            page_count = 1 + len(rest)
+            return pdf_data, page_count
+    except Exception as convert_err:
+        logger.warning(
+            "Failed to convert image attachment %s to PDF: %s",
+            source_name or 'image attachment',
+            convert_err,
+        )
+        return None, 0
+
+
 # --- Helper: normalize image lookup keys (NFKC, strip zero-width, collapse spaces) ---
 def _normalize_key(s: str) -> str:
     """Normalize strings used as image lookup keys: NFKC + strip zero-width + collapse spaces."""
@@ -853,6 +923,8 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
             cloc = part.get('Content-Location')
             fname = part.get_filename()
 
+            is_attachment = 'attachment' in cdisp
+
             if ctype == 'message/rfc822' or (fname and fname.lower().endswith(('.eml', '.msg'))):
                 payload = part.get_payload(decode=True) or part.get_payload()
                 if 'attachment' in cdisp or fname:
@@ -902,54 +974,67 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                     if isinstance(payload, (bytes, bytearray)):
                         img_bytes = payload
                 if img_bytes:
-                    img_bytes, ctype_for_data = ensure_displayable_image(
-                        img_bytes,
-                        ctype_for_data or ctype,
-                        source_name=fname or cloc or cid,
-                    )
-                    if not ctype_for_data:
-                        ctype_for_data = 'image/png'
-                    b64 = base64.b64encode(img_bytes).decode('utf-8')
-                    data_url = f"data:{ctype_for_data};base64,{b64}"
-                    keys = set()
-                    if cid:
-                        keys.add(f"cid:{cid}")
-                        keys.add(cid)
-                    if cloc:
-                        keys.add(cloc)
-                    if fname:
-                        keys.add(fname)
-                        # Also add cid: filename variants so "cid:image001.jpg@..." can resolve via "cid:image001.jpg"
-                        try:
-                            keys.add(f"cid:{fname}")
-                        except Exception:
-                            pass
-                        try:
-                            base = os.path.basename(fname)
-                            if base:
-                                keys.add(base)
-                                keys.add(_normalize_key(base))
-                                try:
-                                    keys.add(f"cid:{base}")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                    for k in keys:
-                        try:
-                            images[k] = data_url
-                            # Add normalized variants for reliable matching
-                            nk = _normalize_key(str(k))
-                            images[nk] = data_url
-                            if str(k).lower().startswith(('http://', 'https://')):
-                                images[_normalize_url(str(k))] = data_url
-                        except Exception:
-                            images[k] = data_url
-                    images.setdefault(f"__unref__:{len(images)}", data_url)
+                    if is_attachment:
+                        att_name = fname or f"attachment-{len(attachments)+1}"
+                        attachments.append({
+                            'filename': att_name,
+                            'content_type': ctype or ctype_for_data or 'image/octet-stream',
+                            'data': bytes(img_bytes),
+                        })
+                        logger.info(
+                            "Captured image attachment %s (%s, %d bytes) for later PDF conversion",
+                            att_name,
+                            ctype or ctype_for_data or 'image',
+                            len(img_bytes),
+                        )
+                    else:
+                        img_bytes, ctype_for_data = ensure_displayable_image(
+                            img_bytes,
+                            ctype_for_data or ctype,
+                            source_name=fname or cloc or cid,
+                        )
+                        if not ctype_for_data:
+                            ctype_for_data = 'image/png'
+                        b64 = base64.b64encode(img_bytes).decode('utf-8')
+                        data_url = f"data:{ctype_for_data};base64,{b64}"
+                        keys = set()
+                        if cid:
+                            keys.add(f"cid:{cid}")
+                            keys.add(cid)
+                        if cloc:
+                            keys.add(cloc)
+                        if fname:
+                            keys.add(fname)
+                            # Also add cid: filename variants so "cid:image001.jpg@..." can resolve via "cid:image001.jpg"
+                            try:
+                                keys.add(f"cid:{fname}")
+                            except Exception:
+                                pass
+                            try:
+                                base = os.path.basename(fname)
+                                if base:
+                                    keys.add(base)
+                                    keys.add(_normalize_key(base))
+                                    try:
+                                        keys.add(f"cid:{base}")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        for k in keys:
+                            try:
+                                images[k] = data_url
+                                # Add normalized variants for reliable matching
+                                nk = _normalize_key(str(k))
+                                images[nk] = data_url
+                                if str(k).lower().startswith(('http://', 'https://')):
+                                    images[_normalize_url(str(k))] = data_url
+                            except Exception:
+                                images[k] = data_url
+                        images.setdefault(f"__unref__:{len(images)}", data_url)
                 return
 
             # PDF or other attachments
-            is_attachment = 'attachment' in cdisp
             is_inline_pdf = (ctype == 'application/pdf') or (fname and fname.lower().endswith('.pdf'))
             is_office = ctype in (
                 'application/msword',
@@ -1870,7 +1955,66 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 return False
 
             # Collect PDF attachments from both EML parsing and extracted .msg attachments
-            pdf_attachments = [a for a in (attachments or []) if a.get('content_type') == 'application/pdf' or str(a.get('filename','')).lower().endswith('.pdf')]
+            pdf_attachments = [
+                a for a in (attachments or [])
+                if a.get('content_type') == 'application/pdf' or str(a.get('filename','')).lower().endswith('.pdf')
+            ]
+
+            converted_image_keys: set[str] = set()
+
+            def _append_image_attachments_as_pdf(source_list, label_prefix):
+                if not source_list:
+                    return
+                for idx, att in enumerate(source_list, start=1):
+                    fname = att.get('filename') or f'attachment-{idx}'
+                    ctype = att.get('content_type') or ''
+                    if not _looks_like_image(ctype, fname):
+                        continue
+                    raw = att.get('data') or b''
+                    if not isinstance(raw, (bytes, bytearray)):
+                        try:
+                            raw = bytes(raw)
+                        except Exception:
+                            logger.warning(
+                                "%s image attachment %s has non-bytes payload; skipping",
+                                label_prefix,
+                                fname,
+                            )
+                            continue
+                    if not raw:
+                        logger.warning(
+                            "%s image attachment %s is empty; skipping",
+                            label_prefix,
+                            fname,
+                        )
+                        continue
+
+                    pdf_bytes, page_count = _convert_image_bytes_to_pdf(raw, fname)
+                    if not pdf_bytes:
+                        logger.warning(
+                            "%s image attachment %s could not be converted to PDF",
+                            label_prefix,
+                            fname,
+                        )
+                        continue
+
+                    out_name = os.path.splitext(fname)[0] + '.pdf'
+                    pdf_attachments.append({
+                        'filename': out_name,
+                        'content_type': 'application/pdf',
+                        'data': pdf_bytes,
+                    })
+                    converted_image_keys.add(out_name.lower())
+                    logger.info(
+                        "%s image attachment %s converted to PDF (%d page%s, %d bytes)",
+                        label_prefix,
+                        out_name,
+                        page_count,
+                        's' if page_count != 1 else '',
+                        len(pdf_bytes),
+                    )
+
+            _append_image_attachments_as_pdf(attachments, 'Email')
             
             # Process .msg attachments (embedded .msg files and other PDFs from extract-msg)
             logger.info(f"MSG ATTACHMENTS PARAMETER: {msg_attachments is not None}, LENGTH: {len(msg_attachments) if msg_attachments else 0}")
@@ -1907,6 +2051,45 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                                 logger.warning(f"Failed to convert embedded EML to PDF: {att_filename}")
                         except Exception as eml_e:
                             logger.warning(f"Error converting embedded EML {att_filename} to PDF: {eml_e}")
+                    elif _looks_like_image(att_content_type, att_filename):
+                        img_data = att.get('data') or b''
+                        if not isinstance(img_data, (bytes, bytearray)):
+                            try:
+                                img_data = bytes(img_data)
+                            except Exception:
+                                logger.warning(
+                                    "Skipping image attachment %s from msg_attachments; payload is not bytes",
+                                    att_filename,
+                                )
+                                continue
+                        if not img_data:
+                            logger.warning(f"Skipping empty image attachment {att_filename}")
+                            continue
+                        pdf_bytes, page_count = _convert_image_bytes_to_pdf(img_data, att_filename)
+                        if not pdf_bytes:
+                            logger.warning(f"Failed to convert image attachment {att_filename} to PDF")
+                            continue
+
+                        out_name = os.path.splitext(att_filename or f"attachment-{len(pdf_attachments)+1}")[0] + '.pdf'
+                        if out_name.lower() in converted_image_keys:
+                            logger.info(
+                                "Skipping duplicate image attachment %s already converted to PDF",
+                                out_name,
+                            )
+                            continue
+                        pdf_attachments.append({
+                            'filename': out_name,
+                            'content_type': 'application/pdf',
+                            'data': pdf_bytes
+                        })
+                        converted_image_keys.add(out_name.lower())
+                        logger.info(
+                            "Converted image attachment %s to PDF (%d page%s, %d bytes)",
+                            out_name,
+                            page_count,
+                            's' if page_count != 1 else '',
+                            len(pdf_bytes),
+                        )
                     elif att.get('content_type') == 'text/plain' and str(att.get('filename', '')).lower().endswith('.txt'):
                         # Convert embedded message text to PDF
                         try:
