@@ -264,6 +264,82 @@ def get_part_content(part):
             logger.error(f"Failed to extract content with fallback: {str(e2)}")
         return None
 
+def _sanitize_css_values(prop: str, value: str) -> str:
+    """Return a safe value for CSS break properties.
+
+    Any explicit page/column break requests are neutralized to 'auto'. We keep
+    'avoid' only for the *inside* variants which helps keep elements together
+    without forcing a new page.
+    """
+    try:
+        p = (prop or '').strip().lower()
+        v = (value or '').strip().lower()
+
+        if not p:
+            return value
+
+        if p == 'page':
+            return 'auto'
+
+        # Tokens that trigger a new page/column and should be removed
+        hard_break_tokens = (
+            'always', 'page', 'left', 'right', 'recto', 'verso', 'column'
+        )
+
+        if any(t in v for t in hard_break_tokens):
+            if p.endswith('inside'):
+                # Prefer auto over avoid when hard tokens are present in 'inside'
+                return 'auto'
+            # Neutralize before/after hard breaks
+            return 'auto'
+
+        if p.startswith('mso-') and 'page' in p:
+            return 'auto'
+
+        # Keep existing values otherwise
+        return value
+    except Exception:
+        return value
+
+
+def _sanitize_style_block_css(css_text: str) -> tuple[str, int]:
+    """Sanitize a full <style> block's CSS and return (sanitized, replacements).
+
+    Replaces any page/column break directives that could cause the body to
+    start on a new page (e.g. 'break-before: page', 'page-break-after: always').
+    """
+    try:
+        replacements = 0
+
+        def repl(m: re.Match) -> str:
+            nonlocal replacements
+            prop = m.group('prop')
+            value = m.group('value')
+            safe = _sanitize_css_values(prop, value)
+            if safe != value:
+                replacements += 1
+            return f"{m.group('prop')}{m.group('separator')}{safe}{m.group('suffix')}"
+
+        # Generic matcher for break-related properties
+        pattern = re.compile(
+            r"(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside|page|mso-page)"
+            r"(?P<separator>\s*:\s*)(?P<value>[^;}{]+)(?P<suffix>;?)",
+            flags=re.IGNORECASE,
+        )
+        sanitized = pattern.sub(repl, css_text or "")
+
+        # Remove @page declarations which can enforce page breaks via named sections
+        page_pattern = re.compile(r'@page\s+[^{}]*\{[^{}]*\}', flags=re.IGNORECASE | re.DOTALL)
+        sanitized, page_block_count = page_pattern.subn('', sanitized)
+        if page_block_count:
+            replacements += page_block_count
+            logger.info("SANITIZER: Removed %s @page declaration(s)", page_block_count)
+
+        return sanitized, replacements
+    except Exception:
+        return css_text, 0
+
+
 def clean_html_content(html_content: str, style_collector: list[str] | None = None) -> str:
     """Basic HTML sanitation and cleanup.
 
@@ -282,36 +358,23 @@ def clean_html_content(html_content: str, style_collector: list[str] | None = No
         html_content = re.sub(r'<o:p[^>]*>.*?</o:p>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
         html_content = re.sub(r'<!\[if[^>]*>.*?<!\[endif\]>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
 
-        page_break_defaults = {
-            'page-break-before': 'auto',
-            'page-break-after': 'auto',
-            'break-before': 'auto',
-            'break-after': 'auto',
-            'page-break-inside': 'avoid',
-            'break-inside': 'avoid',
-        }
-
         style_attr_pattern = re.compile(
             r"""(\sstyle\s*=\s*)(?P<quote>["'])(?P<content>.*?)(?P=quote)""",
             flags=re.IGNORECASE | re.DOTALL,
         )
         inline_page_break_pattern = re.compile(
-            r"""(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside)"""
-            r"""(?P<separator>\s*:\s*)(?P<value>[^;]*)(?P<suffix>;?)""",
+            r"(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside|page)"
+            r"(?P<separator>\s*:\s*)(?P<value>[^;]*)(?P<suffix>;?)",
             flags=re.IGNORECASE,
         )
 
         def _sanitize_style_content(style_content: str) -> str:
             def _replace(match: re.Match[str]) -> str:
                 value = match.group('value')
-                if not re.search(r"\balways\b", value, flags=re.IGNORECASE):
-                    return match.group(0)
                 prop_name = match.group('prop').lower()
-                safe_value = page_break_defaults.get(prop_name, 'auto')
-                sanitized_value = re.sub(r"\balways\b", safe_value, value, flags=re.IGNORECASE)
-                return (
-                    f"{match.group('prop')}{match.group('separator')}{sanitized_value}{match.group('suffix')}"
-                )
+                safe = _sanitize_css_values(prop_name, value)
+                # If we changed the value, great; otherwise keep as-is
+                return f"{match.group('prop')}{match.group('separator')}{safe}{match.group('suffix')}"
 
             return inline_page_break_pattern.sub(_replace, style_content)
 
@@ -322,7 +385,28 @@ def clean_html_content(html_content: str, style_collector: list[str] | None = No
             sanitized_content = _sanitize_style_content(content)
             return f"{prefix}{quote}{sanitized_content}{quote}"
 
+        # Sanitize inline style attributes
         html_content = style_attr_pattern.sub(_sanitize_style_attribute, html_content)
+
+        # Additionally, if we're collecting <style> blocks, sanitize them in place
+        if style_collector is not None and style_collector:
+            sanitized_blocks: list[str] = []
+            total_replacements = 0
+            for block in style_collector:
+                try:
+                    # Extract inner CSS of the style tag
+                    inner = re.sub(r'^<style[^>]*>|</style>$', '', block, flags=re.IGNORECASE).strip()
+                    inner_sanitized, reps = _sanitize_style_block_css(inner)
+                    total_replacements += reps
+                    sanitized_blocks.append(f"<style>\n{inner_sanitized}\n</style>")
+                except Exception:
+                    sanitized_blocks.append(block)
+            # Replace the collector contents with sanitized versions so later
+            # reattachment uses the safe CSS
+            style_collector.clear()
+            style_collector.extend(sanitized_blocks)
+            if total_replacements:
+                logger.info(f"SANITIZER: Neutralized {total_replacements} break directive(s) in <style> blocks")
         return html_content
     except Exception as e:
         logger.warning(f"Error cleaning HTML content: {str(e)}")
@@ -373,6 +457,56 @@ def normalize_whitespace(html_content: str) -> str:
     
     # Trim leading/trailing whitespace from the entire block
     return content.strip()
+
+
+# --- Helper: remove Word-specific wrapper divs/classes that force page breaks ---
+def _strip_word_section_wrappers(html_fragment: str) -> tuple[str, dict[str, int]]:
+    if not html_fragment:
+        return html_fragment, {'wrappers_removed': 0, 'class_refs_removed': 0}
+
+    content = html_fragment.strip()
+    wrappers_removed = 0
+
+    # Remove outer <div class="WordSectionX"> wrappers introduced by Word export
+    wrapper_pattern = re.compile(
+        r'^\s*<div\b([^>]*)class\s*=\s*(["\"])'  # opening <div ... class="
+        r'(?P<classes>[^"\'>]*wordsection[^"\'>]*)\2([^>]*)>'
+        r'(?P<inner>.*)</div>\s*$',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Iteratively unwrap up to a reasonable depth to avoid catastrophic backtracking
+    for _ in range(5):
+        m = wrapper_pattern.match(content)
+        if not m:
+            break
+        inner = m.group('inner').strip()
+        if not inner:
+            break
+        content = inner
+        wrappers_removed += 1
+
+    class_refs_removed = 0
+
+    def _class_replacer(match: re.Match) -> str:
+        nonlocal class_refs_removed
+        quote = match.group(1)
+        classes_raw = match.group(2)
+        classes = re.split(r'\s+', classes_raw.strip()) if classes_raw.strip() else []
+        filtered = [c for c in classes if 'wordsection' not in c.lower()]
+        removed = len(classes) - len(filtered)
+        class_refs_removed += removed
+        if not filtered:
+            return ''
+        return f' class={quote}{" ".join(filtered)}{quote}'
+
+    class_pattern = re.compile(r'\sclass\s*=\s*(["\'])([^"\']*)(\1)', flags=re.IGNORECASE)
+    content = class_pattern.sub(_class_replacer, content)
+
+    return content, {
+        'wrappers_removed': wrappers_removed,
+        'class_refs_removed': class_refs_removed,
+    }
 
 
 # --- Helper: normalize image lookup keys (NFKC, strip zero-width, collapse spaces) ---
@@ -1371,6 +1505,16 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 logger.info("Stripped outer HTML tags from body")
         except Exception as e:
             logger.warning(f"Failed to strip outer HTML tags: {e}")
+
+        if body:
+            body, word_cleanup = _strip_word_section_wrappers(body)
+            if word_cleanup.get('wrappers_removed') or word_cleanup.get('class_refs_removed'):
+                logger.info(
+                    "WORD CLEANUP: Removed %s WordSection wrapper(s); stripped %s WordSection class reference(s)",
+                    word_cleanup.get('wrappers_removed', 0),
+                    word_cleanup.get('class_refs_removed', 0),
+                )
+
         # Prepare optional inline attachment note (avoid automated-looking header pages in final PDF)
         try:
             _pdf_att_meta = [
@@ -1398,6 +1542,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         if original_style_blocks:
             unique_styles: list[str] = []
             seen_styles = set()
+            total_replacements_css = 0
             for block in original_style_blocks:
                 normalized_block = (block or "").strip()
                 if not normalized_block:
@@ -1405,16 +1550,30 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 if normalized_block in seen_styles:
                     continue
                 seen_styles.add(normalized_block)
-                unique_styles.append(block.strip())
+                # Sanitize the CSS content inside the style tag to neutralize hard breaks
+                try:
+                    inner = re.sub(r'^<style[^>]*>|</style>$', '', normalized_block, flags=re.IGNORECASE).strip()
+                    inner_sanitized, reps = _sanitize_style_block_css(inner)
+                    total_replacements_css += reps
+                    unique_styles.append(f"<style>\n{inner_sanitized}\n</style>")
+                except Exception:
+                    unique_styles.append(block.strip())
             if unique_styles:
                 combined_styles = "\n".join(unique_styles)
                 additional_style_markup = "\n" + textwrap.indent(combined_styles, "            ") + "\n"
+                if total_replacements_css:
+                    logger.info(f"SANITIZER: Neutralized {total_replacements_css} break directive(s) in collected <style> blocks (final)")
 
         # DIAGNOSTIC: Analyze body content for Word HTML artifacts and size
         word_html_detected = False
         body_size_analysis = {}
         try:
-            if body and ('xmlns:w="urn:schemas-microsoft-com:office:word"' in body or 'Microsoft Word' in body):
+            if body and (
+                'xmlns:w="urn:schemas-microsoft-com:office:word"' in body
+                or 'Microsoft Word' in body
+                or 'WordSection' in body
+                or 'MsoNormal' in body
+            ):
                 word_html_detected = True
                 logger.info("PAGE BREAK DIAGNOSTIC: Microsoft Word HTML detected - aggressive cleanup needed")
             
@@ -1467,28 +1626,16 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 ul, ol {{ margin: 0 0 10px 20px; padding-left: 18px; }}
                 /* CRITICAL: Ensure email header is NOT affected by email-body overrides */
                 .email-header {{
-                    margin: 0 0 2px 0; /* Minimal margin */
+                    margin: 0; /* No margin to ensure tight layout */
                     padding: 0;
                     font-size: 10px; /* Reduced font size */
                     line-height: 1.15; /* Tighter line height */
                     color: #1f1f1f;
                     page-break-after: avoid !important; /* Prevent page break after header */
                     break-after: avoid !important; /* Modern CSS for avoiding breaks */
-                    display: block !important;
-                }}
-                table {{
-                    margin: 0 !important;
-                    padding: 0 !important;
-                    border-collapse: collapse !important;
-                    page-break-inside: auto !important;
-                    break-inside: auto !important;
-                }}
-                td {{
-                    margin: 0 !important;
-                    padding: 0 !important;
-                    vertical-align: top !important;
                     page-break-inside: avoid !important;
                     break-inside: avoid !important;
+                    display: block !important;
                 }}
                 .email-header .header-item {{
                     margin: 0;
@@ -1515,8 +1662,8 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     font-weight: 600 !important; /* Make bold more explicit */
                 }}
                 .email-body {{
+                    margin: 0 !important; /* No margin to ensure content starts immediately */
                     padding: 0 !important;
-                    margin: 0 !important;
                     display: block !important;
                     page-break-before: avoid !important; /* Prevent page break before content */
                     break-before: avoid !important; /* Modern CSS for avoiding breaks */
@@ -1526,6 +1673,16 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     float: none !important;
                     clear: none !important;
                     position: static !important;
+                }}
+                /* Prevent a forced break specifically between header and first body element */
+                .email-header + .email-body {{
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                }}
+                .email-body > *:first-child {{
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                    margin-top: 0 !important;
                 }}
                 .email-body, .email-body * {{
                     /* Forcefully override justification from email inline styles */
@@ -1573,6 +1730,14 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     break-before: avoid !important;
                     break-after: auto !important;
                 }}
+                /* Word HTML containers occasionally trigger a first-page break; neutralize */
+                .email-body .WordSection1,
+                .email-body div[class^="WordSection"],
+                .email-body div[class*="WordSection"],
+                .email-body p.MsoNormal:first-child {{
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                }}
                 .email-body b, .email-body strong {{ font-weight: 700; }}
                 [style*="text-align:justify"], [style*="text-align: justify"] {{
                   text-align: left !important;
@@ -1600,22 +1765,16 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             </style>{additional_style_markup}
         </head>
         <body style="margin:0;padding:0;">
-            <table style="width:100%;border-collapse:collapse;margin:0;padding:0;">
-                <tr>
-                    <td style="margin:0;padding:0;vertical-align:top;">
-                        <div class="email-header">
-                            <div class="header-item header-from"><span class="label">From:</span><span class="value from-value">{sender_value_html}</span></div>
-                            <div class="header-item"><span class="label">Subject:</span><span class="value subject-value">{html.escape(subject)}</span></div>
-                            <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
-                            <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient_display)}</span></div>
-                            {cc_html}
-                        </div>
-                        <div class="email-body">
-                            {body}{attachment_inline_note}
-                        </div>
-                    </td>
-                </tr>
-            </table>
+            <div class="email-header">
+                <div class="header-item header-from"><span class="label">From:</span><span class="value from-value">{sender_value_html}</span></div>
+                <div class="header-item"><span class="label">Subject:</span><span class="value subject-value">{html.escape(subject)}</span></div>
+                <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
+                <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient_display)}</span></div>
+                {cc_html}
+            </div>
+            <div class="email-body">
+                {body}{attachment_inline_note}
+            </div>
         </body>
         </html>
         """
@@ -1648,6 +1807,29 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 logger.warning("No bold cues found in composed HTML; upstream body may be plaintext-only")
         except Exception as diag_e:
             logger.warning(f"Header diagnostic logging failed: {diag_e}")
+
+        # PAGE BREAK DEBUGGING: Add detailed logging for page break issues
+        try:
+            lower_html = html_content.lower()
+            hard_pb = len(re.findall(r"page-break-before\s*:\s*always", lower_html))
+            hard_pb_page = len(re.findall(r"break-before\s*:\s*page", lower_html))
+            logger.info(f"PAGE BREAK DEBUG: HTML content length: {len(html_content)}")
+            logger.info(f"PAGE BREAK DEBUG: 'page-break' in HTML: {'page-break' in lower_html}")
+            logger.info(f"PAGE BREAK DEBUG: 'break-before' in HTML: {'break-before' in lower_html}")
+            logger.info(f"PAGE BREAK DEBUG: 'break-after' in HTML: {'break-after' in lower_html}")
+            if hard_pb or hard_pb_page:
+                logger.warning(f"PAGE BREAK DEBUG: Found hard break directives - page-break-before:always={hard_pb}, break-before:page={hard_pb_page}")
+            logger.info(f"PAGE BREAK DEBUG: Body content preview (first 200 chars): {body[:200] if body else 'EMPTY'}")
+            logger.info(f"PAGE BREAK DEBUG: Body contains <br>: {'<br' in body.lower()}")
+            logger.info(f"PAGE BREAK DEBUG: Body contains <p>: {'<p' in body.lower()}")
+            logger.info(f"PAGE BREAK DEBUG: Body contains <div>: {'<div' in body.lower()}")
+            logger.info(f"PAGE BREAK DEBUG: Header HTML length: {len(header_section) if 'header_section' in locals() else 'N/A'}")
+            logger.info(f"PAGE BREAK DEBUG: Subject length: {len(subject)}")
+            logger.info(f"PAGE BREAK DEBUG: Sender length: {len(sender)}")
+            logger.info(f"PAGE BREAK DEBUG: Recipient length: {len(recipient)}")
+            logger.info(f"PAGE BREAK DEBUG: CC present: {bool(cc_html)}")
+        except Exception as pb_debug_e:
+            logger.warning(f"Page break debug logging failed: {pb_debug_e}")
 
         # Check available /tmp space before creating potentially large PDFs
         required_space = len(eml_content)
@@ -2058,13 +2240,19 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
                         () => {
                             const header = document.querySelector('.email-header');
                             const body = document.querySelector('.email-body');
+                            const first = body && body.firstElementChild ? body.firstElementChild : null;
+                            const cs = first ? window.getComputedStyle(first) : null;
                             return {
                                 headerHeight: header ? header.offsetHeight : 0,
                                 bodyHeight: body ? body.offsetHeight : 0,
                                 totalHeight: document.body.scrollHeight,
                                 viewportHeight: window.innerHeight,
                                 headerDisplay: header ? window.getComputedStyle(header).display : 'none',
-                                bodyDisplay: body ? window.getComputedStyle(body).display : 'none'
+                                bodyDisplay: body ? window.getComputedStyle(body).display : 'none',
+                                firstBodyTag: first ? first.tagName : null,
+                                firstBodyStyle: first ? (first.getAttribute('style') || '') : null,
+                                firstBreakBefore: cs ? (cs.breakBefore || cs.pageBreakBefore || null) : null,
+                                firstBreakAfter: cs ? (cs.breakAfter || cs.pageBreakAfter || null) : null
                             };
                         }
                     """)
