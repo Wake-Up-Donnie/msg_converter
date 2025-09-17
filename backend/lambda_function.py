@@ -264,6 +264,82 @@ def get_part_content(part):
             logger.error(f"Failed to extract content with fallback: {str(e2)}")
         return None
 
+def _sanitize_css_values(prop: str, value: str) -> str:
+    """Return a safe value for CSS break properties.
+
+    Any explicit page/column break requests are neutralized to 'auto'. We keep
+    'avoid' only for the *inside* variants which helps keep elements together
+    without forcing a new page.
+    """
+    try:
+        p = (prop or '').strip().lower()
+        v = (value or '').strip().lower()
+
+        if not p:
+            return value
+
+        if p == 'page':
+            return 'auto'
+
+        # Tokens that trigger a new page/column and should be removed
+        hard_break_tokens = (
+            'always', 'page', 'left', 'right', 'recto', 'verso', 'column'
+        )
+
+        if any(t in v for t in hard_break_tokens):
+            if p.endswith('inside'):
+                # Prefer auto over avoid when hard tokens are present in 'inside'
+                return 'auto'
+            # Neutralize before/after hard breaks
+            return 'auto'
+
+        if p.startswith('mso-') and 'page' in p:
+            return 'auto'
+
+        # Keep existing values otherwise
+        return value
+    except Exception:
+        return value
+
+
+def _sanitize_style_block_css(css_text: str) -> tuple[str, int]:
+    """Sanitize a full <style> block's CSS and return (sanitized, replacements).
+
+    Replaces any page/column break directives that could cause the body to
+    start on a new page (e.g. 'break-before: page', 'page-break-after: always').
+    """
+    try:
+        replacements = 0
+
+        def repl(m: re.Match) -> str:
+            nonlocal replacements
+            prop = m.group('prop')
+            value = m.group('value')
+            safe = _sanitize_css_values(prop, value)
+            if safe != value:
+                replacements += 1
+            return f"{m.group('prop')}{m.group('separator')}{safe}{m.group('suffix')}"
+
+        # Generic matcher for break-related properties
+        pattern = re.compile(
+            r"(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside|page|mso-page)"
+            r"(?P<separator>\s*:\s*)(?P<value>[^;}{]+)(?P<suffix>;?)",
+            flags=re.IGNORECASE,
+        )
+        sanitized = pattern.sub(repl, css_text or "")
+
+        # Remove @page declarations which can enforce page breaks via named sections
+        page_pattern = re.compile(r'@page\s+[^{}]*\{[^{}]*\}', flags=re.IGNORECASE | re.DOTALL)
+        sanitized, page_block_count = page_pattern.subn('', sanitized)
+        if page_block_count:
+            replacements += page_block_count
+            logger.info("SANITIZER: Removed %s @page declaration(s)", page_block_count)
+
+        return sanitized, replacements
+    except Exception:
+        return css_text, 0
+
+
 def clean_html_content(html_content: str, style_collector: list[str] | None = None) -> str:
     """Basic HTML sanitation and cleanup.
 
@@ -281,6 +357,56 @@ def clean_html_content(html_content: str, style_collector: list[str] | None = No
         html_content = re.sub(r'\s*javascript\s*:', '', html_content, flags=re.IGNORECASE)
         html_content = re.sub(r'<o:p[^>]*>.*?</o:p>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
         html_content = re.sub(r'<!\[if[^>]*>.*?<!\[endif\]>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+
+        style_attr_pattern = re.compile(
+            r"""(\sstyle\s*=\s*)(?P<quote>["'])(?P<content>.*?)(?P=quote)""",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        inline_page_break_pattern = re.compile(
+            r"(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside|page)"
+            r"(?P<separator>\s*:\s*)(?P<value>[^;]*)(?P<suffix>;?)",
+            flags=re.IGNORECASE,
+        )
+
+        def _sanitize_style_content(style_content: str) -> str:
+            def _replace(match: re.Match[str]) -> str:
+                value = match.group('value')
+                prop_name = match.group('prop').lower()
+                safe = _sanitize_css_values(prop_name, value)
+                # If we changed the value, great; otherwise keep as-is
+                return f"{match.group('prop')}{match.group('separator')}{safe}{match.group('suffix')}"
+
+            return inline_page_break_pattern.sub(_replace, style_content)
+
+        def _sanitize_style_attribute(match):
+            prefix = match.group(1)
+            quote = match.group('quote')
+            content = match.group('content')
+            sanitized_content = _sanitize_style_content(content)
+            return f"{prefix}{quote}{sanitized_content}{quote}"
+
+        # Sanitize inline style attributes
+        html_content = style_attr_pattern.sub(_sanitize_style_attribute, html_content)
+
+        # Additionally, if we're collecting <style> blocks, sanitize them in place
+        if style_collector is not None and style_collector:
+            sanitized_blocks: list[str] = []
+            total_replacements = 0
+            for block in style_collector:
+                try:
+                    # Extract inner CSS of the style tag
+                    inner = re.sub(r'^<style[^>]*>|</style>$', '', block, flags=re.IGNORECASE).strip()
+                    inner_sanitized, reps = _sanitize_style_block_css(inner)
+                    total_replacements += reps
+                    sanitized_blocks.append(f"<style>\n{inner_sanitized}\n</style>")
+                except Exception:
+                    sanitized_blocks.append(block)
+            # Replace the collector contents with sanitized versions so later
+            # reattachment uses the safe CSS
+            style_collector.clear()
+            style_collector.extend(sanitized_blocks)
+            if total_replacements:
+                logger.info(f"SANITIZER: Neutralized {total_replacements} break directive(s) in <style> blocks")
         return html_content
     except Exception as e:
         logger.warning(f"Error cleaning HTML content: {str(e)}")
@@ -333,6 +459,190 @@ def normalize_whitespace(html_content: str) -> str:
     return content.strip()
 
 
+# --- Helper: remove Word-specific wrapper divs/classes that force page breaks ---
+def _strip_word_section_wrappers(html_fragment: str) -> tuple[str, dict[str, int]]:
+    if not html_fragment:
+        return html_fragment, {'wrappers_removed': 0, 'class_refs_removed': 0}
+
+    content = html_fragment.strip()
+    wrappers_removed = 0
+
+    # Remove outer <div class="WordSectionX"> wrappers introduced by Word export
+    wrapper_pattern = re.compile(
+        r'^\s*<div\b([^>]*)class\s*=\s*(["\"])'  # opening <div ... class="
+        r'(?P<classes>[^"\'>]*wordsection[^"\'>]*)\2([^>]*)>'
+        r'(?P<inner>.*)</div>\s*$',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Iteratively unwrap up to a reasonable depth to avoid catastrophic backtracking
+    for _ in range(5):
+        m = wrapper_pattern.match(content)
+        if not m:
+            break
+        inner = m.group('inner').strip()
+        if not inner:
+            break
+        content = inner
+        wrappers_removed += 1
+
+    class_refs_removed = 0
+
+    def _class_replacer(match: re.Match) -> str:
+        nonlocal class_refs_removed
+        quote = match.group(1)
+        classes_raw = match.group(2)
+        classes = re.split(r'\s+', classes_raw.strip()) if classes_raw.strip() else []
+        filtered = [c for c in classes if 'wordsection' not in c.lower()]
+        removed = len(classes) - len(filtered)
+        class_refs_removed += removed
+        if not filtered:
+            return ''
+        return f' class={quote}{" ".join(filtered)}{quote}'
+
+    class_pattern = re.compile(r'\sclass\s*=\s*(["\'])([^"\']*)(\1)', flags=re.IGNORECASE)
+    content = class_pattern.sub(_class_replacer, content)
+
+    return content, {
+        'wrappers_removed': wrappers_removed,
+        'class_refs_removed': class_refs_removed,
+    }
+
+
+IMAGE_ATTACHMENT_EXTENSIONS = (
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic', '.heif'
+)
+
+SUPPORTED_INLINE_IMAGE_TYPES = {
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+    'image/gif',
+    'image/webp',
+    'image/bmp',
+    'image/svg+xml',
+}
+
+
+def _looks_like_image(content_type: str | None, filename: str | None) -> bool:
+    ctype = (content_type or '').lower()
+    if ctype.startswith('image/'):
+        return True
+    if filename and filename.lower().endswith(IMAGE_ATTACHMENT_EXTENSIONS):
+        return True
+    return False
+
+
+def _ensure_displayable_image_bytes(img_bytes, content_type, source_name: str | None = None) -> tuple[bytes | None, str | None]:
+    """Return (image_bytes, content_type) convertible for browser display (prefer PNG)."""
+    if not isinstance(img_bytes, (bytes, bytearray)) or not img_bytes:
+        return None, content_type
+
+    normalized_ct = (content_type or '').lower()
+    if normalized_ct in SUPPORTED_INLINE_IMAGE_TYPES:
+        return bytes(img_bytes), normalized_ct or 'image/png'
+
+    label = source_name or 'inline image'
+    try:
+        from PIL import Image
+    except Exception as import_err:
+        logger.warning(
+            "Unable to import Pillow for converting %s (%s); rendering may fail: %s",
+            label,
+            normalized_ct or 'unknown',
+            import_err,
+        )
+        return bytes(img_bytes), content_type or 'application/octet-stream'
+
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as pil_img:
+            try:
+                if getattr(pil_img, 'n_frames', 1) > 1:
+                    pil_img.seek(0)
+            except Exception:
+                pass
+
+            if pil_img.mode in ('P', 'PA', 'LA', 'RGBA'):
+                pil_img = pil_img.convert('RGBA')
+            elif pil_img.mode not in ('RGB', 'L'):
+                pil_img = pil_img.convert('RGB')
+
+            buffer = io.BytesIO()
+            save_mode = 'PNG'
+            pil_img.save(buffer, format=save_mode)
+            converted = buffer.getvalue()
+            logger.info(
+                "Converted inline image %s from %s to image/png for browser rendering",
+                label,
+                normalized_ct or 'unknown',
+            )
+            return converted, 'image/png'
+    except Exception as convert_err:
+        logger.warning(
+            "Failed to convert inline image %s (%s) to PNG: %s",
+            label,
+            normalized_ct or 'unknown',
+            convert_err,
+        )
+    return bytes(img_bytes), content_type or 'application/octet-stream'
+
+
+def _convert_image_bytes_to_pdf(image_bytes: bytes, source_name: str | None = None) -> tuple[bytes | None, int]:
+    """Convert raw image bytes into a PDF. Returns (pdf_bytes, page_count)."""
+    if not isinstance(image_bytes, (bytes, bytearray)) or not image_bytes:
+        return None, 0
+
+    try:
+        from PIL import Image, ImageSequence
+    except Exception as import_err:
+        logger.warning(
+            "Image->PDF conversion requires Pillow; skipping %s: %s",
+            source_name or 'image attachment',
+            import_err,
+        )
+        return None, 0
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            frames = []
+            try:
+                iterator = ImageSequence.Iterator(img)
+            except Exception:
+                iterator = [img]
+
+            for frame in iterator:
+                converted = frame.convert('RGB') if frame.mode != 'RGB' else frame.copy()
+                frames.append(converted.copy())
+
+            if not frames:
+                frames.append(img.convert('RGB'))
+
+            buffer = io.BytesIO()
+            first = frames[0]
+            rest = frames[1:]
+            if rest:
+                first.save(buffer, format='PDF', save_all=True, append_images=rest)
+            else:
+                first.save(buffer, format='PDF')
+
+            for f in frames:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+            pdf_data = buffer.getvalue()
+            page_count = 1 + len(rest)
+            return pdf_data, page_count
+    except Exception as convert_err:
+        logger.warning(
+            "Failed to convert image attachment %s to PDF: %s",
+            source_name or 'image attachment',
+            convert_err,
+        )
+        return None, 0
+
+
 # --- Helper: normalize image lookup keys (NFKC, strip zero-width, collapse spaces) ---
 def _normalize_key(s: str) -> str:
     """Normalize strings used as image lookup keys: NFKC + strip zero-width + collapse spaces."""
@@ -380,6 +690,134 @@ def _normalize_url(u: str) -> str:
         return new
     except Exception:
         return (u or "").replace("\u200B", "").replace("\uFEFF", "").replace("\u2060", "").replace("\u00AD", "")
+
+
+_TRAILING_WS_RE = re.compile(r'(?:\s|&nbsp;|&#160;)+$', re.IGNORECASE)
+_TRAILING_BREAKS_RE = re.compile(r'(?:<br\s*/?>\s*)+$', re.IGNORECASE)
+_TRAILING_EMPTY_CONTAINER_RE = re.compile(
+    r'(?:<(?:div|p|span|font|section|article)[^>]*>(?:\s|&nbsp;|&#160;|<br\s*/?>)*</(?:div|p|span|font|section|article)>\s*)+$',
+    re.IGNORECASE,
+)
+_TRAILING_COMMENT_RE = re.compile(r'<!--[\s\S]*?-->\s*$', re.IGNORECASE)
+
+_LEADING_WS_RE = re.compile(r'^(?:\s|&nbsp;|&#160;)+', re.IGNORECASE)
+_LEADING_BREAKS_RE = re.compile(r'^(?:<br\s*/?>\s*)+', re.IGNORECASE)
+_LEADING_EMPTY_CONTAINER_RE = re.compile(
+    r'^(?:<(?:div|p|span|font|section|article)[^>]*>(?:\s|&nbsp;|&#160;|<br\s*/?>)*</(?:div|p|span|font|section|article)>\s*)+',
+    re.IGNORECASE,
+)
+_LEADING_COMMENT_RE = re.compile(r'^<!--[\s\S]*?-->\s*', re.IGNORECASE)
+
+
+def _strip_trailing_empty_html(fragment: str | None) -> str:
+    """Remove trailing whitespace, <br>, and empty block containers from an HTML fragment."""
+    if not fragment:
+        return ''
+
+    cleaned = fragment
+    while True:
+        updated = _TRAILING_COMMENT_RE.sub('', cleaned)
+        updated = _TRAILING_BREAKS_RE.sub('', updated)
+        updated = _TRAILING_EMPTY_CONTAINER_RE.sub('', updated)
+        updated = _TRAILING_WS_RE.sub('', updated)
+        if updated == cleaned:
+            break
+        cleaned = updated
+    return cleaned
+
+
+def _strip_leading_empty_html(fragment: str | None) -> str:
+    """Remove leading whitespace, <br>, and empty block containers from an HTML fragment."""
+    if not fragment:
+        return ''
+
+    cleaned = fragment
+    while True:
+        updated = _LEADING_COMMENT_RE.sub('', cleaned)
+        updated = _LEADING_BREAKS_RE.sub('', updated)
+        updated = _LEADING_EMPTY_CONTAINER_RE.sub('', updated)
+        updated = _LEADING_WS_RE.sub('', updated)
+        if updated == cleaned:
+            break
+        cleaned = updated
+    return cleaned
+
+
+def _normalize_body_html_fragment(fragment: str | None) -> str:
+    """Trim leading/trailing empty markup so visible content starts immediately."""
+    return _strip_trailing_empty_html(_strip_leading_empty_html(fragment))
+
+
+def _append_html_after_body_content(body_html: str | None, addition: str) -> str:
+    """Append ``addition`` immediately after the last non-empty body element."""
+    if not addition:
+        return body_html or ''
+
+    base = _normalize_body_html_fragment(body_html)
+    if not base:
+        return addition
+
+    separator = "" if base.endswith((">", "\n")) else "\n"
+    return base + separator + addition
+
+
+def _inline_image_attachments_into_body(
+    body_html: str,
+    attachment_list: list[dict],
+    source_label: str,
+) -> tuple[str, list[dict], list[str]]:
+    """Embed image attachments as inline <figure> elements inside the body HTML."""
+    if not attachment_list:
+        return body_html, attachment_list, []
+
+    remaining: list[dict] = []
+    inline_figures: list[str] = []
+    inlined_names: list[str] = []
+
+    for att in attachment_list:
+        fname = att.get('filename') or ''
+        ctype = att.get('content_type') or ''
+        data = att.get('data')
+        if not _looks_like_image(ctype, fname) or not isinstance(data, (bytes, bytearray)):
+            remaining.append(att)
+            continue
+
+        display_bytes, usable_type = _ensure_displayable_image_bytes(data, ctype, fname)
+        payload = display_bytes or bytes(data)
+        if not payload:
+            remaining.append(att)
+            continue
+
+        try:
+            b64 = base64.b64encode(payload).decode('utf-8')
+        except Exception as b64_err:
+            logger.warning(
+                "Failed to base64 inline image attachment %s (%s): %s",
+                fname,
+                usable_type or ctype or 'image',
+                b64_err,
+            )
+            remaining.append(att)
+            continue
+
+        alt_text = html.escape(fname or 'image attachment')
+        data_url = f"data:{usable_type or ctype or 'image/png'};base64,{b64}"
+        figure_html = (
+            f'<figure class="inline-attachment" data-source="{html.escape(source_label)}">'
+            f'<img src="{data_url}" alt="{alt_text}">' \
+            f'<figcaption>{alt_text}</figcaption></figure>'
+        )
+        inline_figures.append(figure_html)
+        inlined_names.append(fname or 'image attachment')
+
+    if inline_figures:
+        wrapper = (
+            '<div class="image-attachments">'
+            + ''.join(inline_figures)
+            + '</div>'
+        )
+        body_html = _append_html_after_body_content(body_html, wrapper)
+    return body_html, remaining, inlined_names
 
 def replace_image_references(html_content: str, images: Dict[str, str]) -> str:
     """Replace <img src> values (cid:, filenames, content-location) with data URLs.
@@ -591,13 +1029,8 @@ def replace_image_references(html_content: str, images: Dict[str, str]) -> str:
         to_append = [u for u in unique_data_urls if u not in used_data_urls and u not in html_new]
         if to_append:
             imgs = ''.join([f'<img src="{u}" alt="attachment" class="inline-image" />' for u in to_append])
-            html_new += '<div style="margin-top:20px"><h4>Attached Images:</h4>' + imgs + '</div>'
-
-        # Diagnostics (safe counts only)
-        try:
-            logger.info(f"Image rewrite: embedded_used={len(used_data_urls)}, sanitized_external={stats['sanitized']}, inlined_external={stats['inlined']}")
-        except Exception:
-            pass
+            appended_block = '<div class="image-attachments unreferenced-inline-images">' + imgs + '</div>'
+            html_new = _append_html_after_body_content(html_new, appended_block)
 
         return html_new
     except Exception as e:
@@ -613,60 +1046,6 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
     collected_styles: list[str] = []
     extract_body_and_images_from_email.last_collected_styles = collected_styles
 
-    supported_inline_image_types = {
-        'image/png',
-        'image/jpeg',
-        'image/jpg',
-        'image/gif',
-        'image/webp',
-        'image/bmp',
-        'image/svg+xml',
-    }
-
-    def ensure_displayable_image(img_bytes, content_type, source_name=None):
-        """Convert unsupported inline image formats (e.g., TIFF) into browser-friendly PNG."""
-        if not isinstance(img_bytes, (bytes, bytearray)) or not img_bytes:
-            return img_bytes, content_type
-
-        normalized_ct = (content_type or '').lower()
-        if normalized_ct in supported_inline_image_types:
-            return bytes(img_bytes), normalized_ct or 'image/png'
-
-        source_label = source_name or 'inline image'
-        try:
-            from PIL import Image
-        except Exception as import_err:
-            logger.warning(
-                f"Unable to import Pillow for converting {source_label} ({normalized_ct or 'unknown'}); rendering may fail: {import_err}"
-            )
-            return bytes(img_bytes), content_type or 'application/octet-stream'
-
-        try:
-            with Image.open(io.BytesIO(img_bytes)) as pil_img:
-                try:
-                    if getattr(pil_img, 'n_frames', 1) > 1:
-                        pil_img.seek(0)
-                except Exception:
-                    pass
-
-                if pil_img.mode in ('P', 'PA', 'LA', 'RGBA'):
-                    pil_img = pil_img.convert('RGBA')
-                elif pil_img.mode not in ('RGB', 'L'):
-                    pil_img = pil_img.convert('RGB')
-
-                buffer = io.BytesIO()
-                pil_img.save(buffer, format='PNG')
-                converted = buffer.getvalue()
-                logger.info(
-                    f"Converted inline image {source_label} from {normalized_ct or 'unknown'} to image/png for browser rendering"
-                )
-                return converted, 'image/png'
-        except Exception as convert_err:
-            logger.warning(
-                f"Failed to convert inline image {source_label} ({normalized_ct or 'unknown'}) to PNG: {convert_err}"
-            )
-        return bytes(img_bytes), content_type or 'application/octet-stream'
-
     def process_part(part):
         try:
             ctype = part.get_content_type()
@@ -676,6 +1055,8 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                 cid = cid.strip('<>')
             cloc = part.get('Content-Location')
             fname = part.get_filename()
+
+            is_attachment = 'attachment' in cdisp
 
             if ctype == 'message/rfc822' or (fname and fname.lower().endswith(('.eml', '.msg'))):
                 payload = part.get_payload(decode=True) or part.get_payload()
@@ -726,54 +1107,72 @@ def extract_body_and_images_from_email(msg, msg_attachments=None):
                     if isinstance(payload, (bytes, bytearray)):
                         img_bytes = payload
                 if img_bytes:
-                    img_bytes, ctype_for_data = ensure_displayable_image(
-                        img_bytes,
-                        ctype_for_data or ctype,
-                        source_name=fname or cloc or cid,
-                    )
-                    if not ctype_for_data:
-                        ctype_for_data = 'image/png'
-                    b64 = base64.b64encode(img_bytes).decode('utf-8')
-                    data_url = f"data:{ctype_for_data};base64,{b64}"
-                    keys = set()
-                    if cid:
-                        keys.add(f"cid:{cid}")
-                        keys.add(cid)
-                    if cloc:
-                        keys.add(cloc)
-                    if fname:
-                        keys.add(fname)
-                        # Also add cid: filename variants so "cid:image001.jpg@..." can resolve via "cid:image001.jpg"
-                        try:
-                            keys.add(f"cid:{fname}")
-                        except Exception:
-                            pass
-                        try:
-                            base = os.path.basename(fname)
-                            if base:
-                                keys.add(base)
-                                keys.add(_normalize_key(base))
-                                try:
-                                    keys.add(f"cid:{base}")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                    for k in keys:
-                        try:
-                            images[k] = data_url
-                            # Add normalized variants for reliable matching
-                            nk = _normalize_key(str(k))
-                            images[nk] = data_url
-                            if str(k).lower().startswith(('http://', 'https://')):
-                                images[_normalize_url(str(k))] = data_url
-                        except Exception:
-                            images[k] = data_url
-                    images.setdefault(f"__unref__:{len(images)}", data_url)
+                    if is_attachment:
+                        att_name = fname or f"attachment-{len(attachments)+1}"
+                        display_bytes, usable_type = _ensure_displayable_image_bytes(
+                            img_bytes,
+                            ctype_for_data or ctype,
+                            source_name=fname or cloc or cid,
+                        )
+                        attachments.append({
+                            'filename': att_name,
+                            'content_type': usable_type or ctype or 'image/octet-stream',
+                            'data': bytes(display_bytes or img_bytes),
+                        })
+                        logger.info(
+                            "Captured image attachment %s (%s, %d bytes) for later PDF conversion",
+                            att_name,
+                            usable_type or ctype or 'image',
+                            len(display_bytes or img_bytes),
+                        )
+                    else:
+                        display_bytes, ctype_for_data = _ensure_displayable_image_bytes(
+                            img_bytes,
+                            ctype_for_data or ctype,
+                            source_name=fname or cloc or cid,
+                        )
+                        if not ctype_for_data:
+                            ctype_for_data = 'image/png'
+                        b64 = base64.b64encode(display_bytes or img_bytes).decode('utf-8')
+                        data_url = f"data:{ctype_for_data};base64,{b64}"
+                        keys = set()
+                        if cid:
+                            keys.add(f"cid:{cid}")
+                            keys.add(cid)
+                        if cloc:
+                            keys.add(cloc)
+                        if fname:
+                            keys.add(fname)
+                            # Also add cid: filename variants so "cid:image001.jpg@..." can resolve via "cid:image001.jpg"
+                            try:
+                                keys.add(f"cid:{fname}")
+                            except Exception:
+                                pass
+                            try:
+                                base = os.path.basename(fname)
+                                if base:
+                                    keys.add(base)
+                                    keys.add(_normalize_key(base))
+                                    try:
+                                        keys.add(f"cid:{base}")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        for k in keys:
+                            try:
+                                images[k] = data_url
+                                # Add normalized variants for reliable matching
+                                nk = _normalize_key(str(k))
+                                images[nk] = data_url
+                                if str(k).lower().startswith(('http://', 'https://')):
+                                    images[_normalize_url(str(k))] = data_url
+                            except Exception:
+                                images[k] = data_url
+                        images.setdefault(f"__unref__:{len(images)}", data_url)
                 return
 
             # PDF or other attachments
-            is_attachment = 'attachment' in cdisp
             is_inline_pdf = (ctype == 'application/pdf') or (fname and fname.lower().endswith('.pdf'))
             is_office = ctype in (
                 'application/msword',
@@ -1077,6 +1476,90 @@ def _format_address_header(value: str | None) -> str:
     return value
 
 
+def _parse_address_pairs(value: str | None) -> list[tuple[str, str]]:
+    """Return parsed ``(display, address)`` tuples for an address header."""
+    if value is None:
+        return []
+
+    if not isinstance(value, str):
+        value = str(value)
+
+    candidate = value.strip()
+    if not candidate:
+        return []
+
+    pairs: list[tuple[str, str]] = []
+    try:
+        raw_addresses = getaddresses([candidate])
+    except Exception:
+        raw_addresses = []
+
+    for display, addr in raw_addresses:
+        display = (display or '').strip()
+        addr = (addr or '').strip()
+        if display or addr:
+            pairs.append((display, addr))
+
+    if pairs:
+        return pairs
+
+    fallback_display, fallback_addr = parseaddr(candidate)
+    fallback_display = (fallback_display or '').strip()
+    fallback_addr = (fallback_addr or '').strip()
+
+    if fallback_display or fallback_addr:
+        return [(fallback_display, fallback_addr)]
+
+    return []
+
+
+def _format_address_header_compact(value: str | None) -> str:
+    """Return a compact string like ``"Name addr"`` without angle brackets."""
+    pairs = _parse_address_pairs(value)
+    if pairs:
+        formatted: list[str] = []
+        for display, addr in pairs:
+            if display and addr:
+                formatted.append(f"{display} {addr}")
+            elif addr:
+                formatted.append(addr)
+            elif display:
+                formatted.append(display)
+
+        if formatted:
+            return ', '.join(formatted)
+
+    if value is None:
+        return "Unknown"
+
+    return str(value).strip()
+
+
+def _build_sender_value_html(value: str | None) -> str:
+    """Create HTML markup that bolds the sender name and keeps email lightweight."""
+    pairs = _parse_address_pairs(value)
+
+    if not pairs:
+        fallback = (value or 'Unknown Sender').strip() or 'Unknown Sender'
+        return f"<span class=\"from-name\">{html.escape(fallback)}</span>"
+
+    if len(pairs) > 1:
+        compact = _format_address_header_compact(value)
+        safe = html.escape(compact if compact else (value or 'Unknown Sender'))
+        return f"<span class=\"from-name\">{safe}</span>"
+
+    display, addr = pairs[0]
+    primary = display or addr or (value or '').strip() or 'Unknown Sender'
+
+    segments: list[str] = []
+    segments.append(f"<span class=\"from-name\">{html.escape(primary)}</span>")
+
+    if addr and addr != primary:
+        segments.append(f"<span class=\"from-email\">{html.escape(addr)}</span>")
+
+    return ' '.join(segments)
+
+
 def _extract_display_date(msg) -> str:
     """Return a human-readable date for the message with sensible fallbacks.
     Prefers the Date header as-is; falls back to common alternative headers or the trailing
@@ -1132,10 +1615,25 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         subject = _safe_decode_header(msg.get('Subject', 'No Subject'))
         sender_decoded = _safe_decode_header(msg.get('From', 'Unknown Sender'))
         recipient_decoded = _safe_decode_header(msg.get('To', 'Unknown Recipient'))
+        cc_decoded = _safe_decode_header(msg.get('Cc', ''))
         sender = _format_address_header(sender_decoded)
         recipient = _format_address_header(recipient_decoded)
+        recipient_compact = _format_address_header_compact(recipient_decoded)
+        recipient_display = recipient_compact or recipient
+        sender_value_html = _build_sender_value_html(sender_decoded)
         date_display = _extract_display_date(msg)
-        logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}'")
+        
+        # Process CC field if present
+        cc_display = ""
+        cc_html = ""
+        if cc_decoded and cc_decoded.strip():
+            cc_formatted = _format_address_header(cc_decoded)
+            cc_compact = _format_address_header_compact(cc_decoded)
+            cc_display = cc_compact or cc_formatted
+            cc_html = f'<div class="header-item"><span class="label">Cc:</span><span class="value">{html.escape(cc_display)}</span></div>'
+            logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Cc='{cc_display}', Date='{date_display}'")
+        else:
+            logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}' (No CC)")
 
         # Debug: Check if the EML has multipart structure
         logger.info(f"DEBUGGING: EML is_multipart: {msg.is_multipart()}")
@@ -1230,7 +1728,45 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 logger.info("Stripped outer HTML tags from body")
         except Exception as e:
             logger.warning(f"Failed to strip outer HTML tags: {e}")
-        # Prepare optional inline attachment note (avoid automated-looking header pages in final PDF)
+
+        if body:
+            body = _normalize_body_html_fragment(body)
+            body, word_cleanup = _strip_word_section_wrappers(body)
+            if word_cleanup.get('wrappers_removed') or word_cleanup.get('class_refs_removed'):
+                logger.info(
+                    "WORD CLEANUP: Removed %s WordSection wrapper(s); stripped %s WordSection class reference(s)",
+                    word_cleanup.get('wrappers_removed', 0),
+                    word_cleanup.get('class_refs_removed', 0),
+                )
+
+        attachments = list(attachments or [])
+        msg_attachments = list(msg_attachments or [])
+
+        body, attachments, inlined_primary = _inline_image_attachments_into_body(
+            body,
+            attachments,
+            'email-attachment',
+        )
+        if inlined_primary:
+            primary_names = {name.lower() for name in inlined_primary}
+            msg_attachments = [
+                att for att in msg_attachments
+                if (att.get('filename') or '').lower() not in primary_names
+            ]
+        body, msg_attachments, inlined_msg = _inline_image_attachments_into_body(
+            body,
+            msg_attachments,
+            'msg-attachment',
+        )
+        if inlined_primary or inlined_msg:
+            logger.info(
+                "INLINE IMAGES: embedded %d email image(s) and %d msg attachment image(s) into body",
+                len(inlined_primary),
+                len(inlined_msg),
+            )
+
+        body = _normalize_body_html_fragment(body)
+
         try:
             _pdf_att_meta = [
                 a for a in (attachments or [])
@@ -1257,17 +1793,50 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         if original_style_blocks:
             unique_styles: list[str] = []
             seen_styles = set()
+            total_replacements_css = 0
             for block in original_style_blocks:
                 normalized_block = (block or "").strip()
-                if not normalized_block:
-                    continue
-                if normalized_block in seen_styles:
+                if not normalized_block or normalized_block in seen_styles:
                     continue
                 seen_styles.add(normalized_block)
-                unique_styles.append(block.strip())
+                try:
+                    inner = re.sub(r'^<style[^>]*>|</style>$', '', normalized_block, flags=re.IGNORECASE).strip()
+                    inner_sanitized, reps = _sanitize_style_block_css(inner)
+                    total_replacements_css += reps
+                    unique_styles.append(f"<style>\n{inner_sanitized}\n</style>")
+                except Exception:
+                    unique_styles.append(normalized_block)
             if unique_styles:
                 combined_styles = "\n".join(unique_styles)
                 additional_style_markup = "\n" + textwrap.indent(combined_styles, "            ") + "\n"
+
+        word_html_detected = False
+        body_metrics = {
+            'total_chars': len(body or ''),
+            'line_breaks': 0,
+        }
+        try:
+            if body:
+                if any(token in body for token in (
+                    'xmlns:w="urn:schemas-microsoft-com:office:word"',
+                    'Microsoft Word',
+                    'WordSection',
+                    'MsoNormal',
+                )):
+                    word_html_detected = True
+                body_metrics['line_breaks'] = body.count('<br>') + body.count('<p>')
+        except Exception:
+            pass
+
+        inline_blocks = len(inlined_primary) + len(inlined_msg)
+        remaining_attachments = len(attachments or []) + len(msg_attachments or [])
+        logger.info(
+            "CONTENT FLOW: chars=%d, inline_blocks=%d, word_html=%s, remaining_attachments=%d",
+            body_metrics['total_chars'],
+            inline_blocks,
+            word_html_detected,
+            remaining_attachments,
+        )
 
         # Create HTML content (emoji-capable fonts and image styling)
         logger.info("Creating HTML content for PDF generation...")
@@ -1280,7 +1849,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             <style>
                 body {{
                     font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                    line-height: 1.35;
+                    line-height: 1.2; /* Reduced from 1.35 to prevent overflow */
                     margin: 0;
                     padding: 0;
                     color: #333;
@@ -1304,6 +1873,56 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 li {{ margin: 0 0 4px; }}
                 h1, h2, h3, h4, h5, h6 {{ margin: 12px 0 6px; }}
                 ul, ol {{ margin: 0 0 10px 20px; padding-left: 18px; }}
+                /* CRITICAL: Ensure email header is NOT affected by email-body overrides */
+                .email-header {{
+                    margin: 0; /* No margin to ensure tight layout */
+                    padding: 0;
+                    font-size: 10px; /* Reduced font size */
+                    line-height: 1.15; /* Tighter line height */
+                    color: #1f1f1f;
+                    page-break-after: avoid !important; /* Prevent page break after header */
+                    break-after: avoid !important; /* Modern CSS for avoiding breaks */
+                    page-break-inside: avoid !important;
+                    break-inside: avoid !important;
+                    display: block !important;
+                }}
+                .email-header .header-item {{
+                    margin: 0;
+                }}
+                .email-header .header-item + .header-item {{
+                    margin-top: 3px; /* Increased from 2px for better spacing */
+                }}
+                .email-header .label {{
+                    font-weight: 700 !important; /* Make bold more explicit */
+                    color: #000 !important;
+                    margin-right: 6px;
+                    display: inline-block;
+                }}
+                .email-header .value {{
+                    display: inline;
+                }}
+                .email-header .from-value .from-name {{
+                    font-weight: 700 !important; /* Make bold more explicit */
+                }}
+                .email-header .from-value .from-email {{
+                    margin-left: 6px;
+                }}
+                .email-header .subject-value {{
+                    font-weight: 600 !important; /* Make bold more explicit */
+                }}
+                .email-body {{
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    display: block !important;
+                    float: none !important;
+                    clear: none !important;
+                    position: static !important;
+                }}
+                .email-body > *:first-child {{
+                    margin-top: 0 !important;
+                    page-break-before: auto !important;
+                    break-before: auto !important;
+                }}
                 .email-body, .email-body * {{
                     /* Forcefully override justification from email inline styles */
                     white-space: normal !important; /* Override Outlook's 'pre' on spans */
@@ -1312,6 +1931,78 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                     letter-spacing: normal !important;
                     word-spacing: normal !important;
                     text-align-last: left !important;
+                    /* CRITICAL: Override Microsoft Word spacing */
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    /* Override any Word HTML layout properties */
+                    float: none !important;
+                    clear: none !important;
+                    position: static !important;
+                    width: auto !important;
+                    height: auto !important;
+                    max-width: none !important;
+                    max-height: none !important;
+                    min-width: 0 !important;
+                    min-height: 0 !important;
+                }}
+                /* Ultra-aggressive Microsoft Word HTML cleanup */
+                .email-body p {{
+                    margin: 0 0 4px 0 !important;
+                    padding: 0 !important;
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                }}
+                .email-body div {{
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                }}
+                /* Remove any Word-specific page break styles */
+                [style*="page-break"], [style*="break-before"], [style*="break-after"] {{
+                    page-break-before: avoid !important;
+                    page-break-after: auto !important;
+                    break-before: avoid !important;
+                    break-after: auto !important;
+                }}
+                /* Word HTML containers occasionally trigger a first-page break; neutralize */
+                .email-body .WordSection1,
+                .email-body div[class^="WordSection"],
+                .email-body div[class*="WordSection"],
+                .email-body p.MsoNormal:first-child {{
+                    page-break-before: avoid !important;
+                    break-before: avoid !important;
+                }}
+                .image-attachments {{
+                    display: block;
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    page-break-before: auto !important;
+                    break-before: auto !important;
+                    page-break-inside: auto !important;
+                    break-inside: auto !important;
+                }}
+                .unreferenced-inline-images {{
+                    width: 100%;
+                }}
+                .inline-attachment {{
+                    margin: 12px auto;
+                    text-align: center;
+                    page-break-inside: auto !important;
+                    break-inside: auto !important;
+                    max-width: 100%;
+                }}
+                .inline-attachment img {{
+                    max-width: 100%;
+                    height: auto;
+                    display: block;
+                    margin: 0 auto;
+                }}
+                .inline-attachment figcaption {{
+                    font-size: 10px;
+                    color: #666;
+                    margin-top: 4px;
+                    word-break: break-word;
                 }}
                 .email-body b, .email-body strong {{ font-weight: 700; }}
                 [style*="text-align:justify"], [style*="text-align: justify"] {{
@@ -1322,31 +2013,6 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 }}
                 .emoji {{
                     font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
-                }}
-                .email-header {{
-                    margin: 0 0 10px 0;
-                    padding: 0;
-                    font-size: 11px;
-                    line-height: 1.45;
-                    color: #1f1f1f;
-                }}
-                .email-body {{ padding: 0 10px 10px 0; }}
-                .header-item {{
-                    display: flex;
-                    align-items: baseline;
-                    gap: 8px;
-                    margin: 0 0 6px;
-                }}
-                .header-item:last-child {{
-                    margin-bottom: 0;
-                }}
-                .label {{
-                    font-weight: 600;
-                    color: #444;
-                    min-width: 64px;
-                }}
-                .value {{
-                    flex: 1;
                 }}
                 img {{
                     max-width: 100%;
@@ -1364,28 +2030,21 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 }}
             </style>{additional_style_markup}
         </head>
-        <body>
+        <body style="margin:0;padding:0;">
             <div class="email-header">
-                <div class="header-item"><span class="label">From:</span><span class="value">{html.escape(sender)}</span></div>
-                <div class="header-item"><span class="label">Sent:</span><span class="value">{html.escape(date_display)}</span></div>
-                <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient)}</span></div>
-                <div class="header-item"><span class="label">Subject:</span><span class="value">{html.escape(subject)}</span></div>
+                <div class="header-item header-from"><span class="label">From:</span><span class="value from-value">{sender_value_html}</span></div>
+                <div class="header-item"><span class="label">Subject:</span><span class="value subject-value">{html.escape(subject)}</span></div>
+                <div class="header-item"><span class="label">Date:</span><span class="value">{html.escape(date_display)}</span></div>
+                <div class="header-item"><span class="label">To:</span><span class="value">{html.escape(recipient_display)}</span></div>
+                {cc_html}
             </div>
-            <div class="email-body wrap">
+            <div class="email-body">
                 {body}{attachment_inline_note}
             </div>
         </body>
         </html>
         """
         logger.info(f"HTML content created: {len(html_content)} characters")
-        try:
-            # Helpful diagnostics to ensure bold cues are present upstream
-            if 'b>' in html_content or 'strong' in html_content.lower() or 'font-weight' in html_content.lower():
-                logger.info("Bold cues detected in composed HTML (tags or inline styles present)")
-            else:
-                logger.warning("No bold cues found in composed HTML; upstream body may be plaintext-only")
-        except Exception:
-            pass
 
         # Check available /tmp space before creating potentially large PDFs
         required_space = len(eml_content)
@@ -1426,7 +2085,66 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 return False
 
             # Collect PDF attachments from both EML parsing and extracted .msg attachments
-            pdf_attachments = [a for a in (attachments or []) if a.get('content_type') == 'application/pdf' or str(a.get('filename','')).lower().endswith('.pdf')]
+            pdf_attachments = [
+                a for a in (attachments or [])
+                if a.get('content_type') == 'application/pdf' or str(a.get('filename','')).lower().endswith('.pdf')
+            ]
+
+            converted_image_keys: set[str] = set()
+
+            def _append_image_attachments_as_pdf(source_list, label_prefix):
+                if not source_list:
+                    return
+                for idx, att in enumerate(source_list, start=1):
+                    fname = att.get('filename') or f'attachment-{idx}'
+                    ctype = att.get('content_type') or ''
+                    if not _looks_like_image(ctype, fname):
+                        continue
+                    raw = att.get('data') or b''
+                    if not isinstance(raw, (bytes, bytearray)):
+                        try:
+                            raw = bytes(raw)
+                        except Exception:
+                            logger.warning(
+                                "%s image attachment %s has non-bytes payload; skipping",
+                                label_prefix,
+                                fname,
+                            )
+                            continue
+                    if not raw:
+                        logger.warning(
+                            "%s image attachment %s is empty; skipping",
+                            label_prefix,
+                            fname,
+                        )
+                        continue
+
+                    pdf_bytes, page_count = _convert_image_bytes_to_pdf(raw, fname)
+                    if not pdf_bytes:
+                        logger.warning(
+                            "%s image attachment %s could not be converted to PDF",
+                            label_prefix,
+                            fname,
+                        )
+                        continue
+
+                    out_name = os.path.splitext(fname)[0] + '.pdf'
+                    pdf_attachments.append({
+                        'filename': out_name,
+                        'content_type': 'application/pdf',
+                        'data': pdf_bytes,
+                    })
+                    converted_image_keys.add(out_name.lower())
+                    logger.info(
+                        "%s image attachment %s converted to PDF (%d page%s, %d bytes)",
+                        label_prefix,
+                        out_name,
+                        page_count,
+                        's' if page_count != 1 else '',
+                        len(pdf_bytes),
+                    )
+
+            _append_image_attachments_as_pdf(attachments, 'Email')
             
             # Process .msg attachments (embedded .msg files and other PDFs from extract-msg)
             logger.info(f"MSG ATTACHMENTS PARAMETER: {msg_attachments is not None}, LENGTH: {len(msg_attachments) if msg_attachments else 0}")
@@ -1463,6 +2181,45 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                                 logger.warning(f"Failed to convert embedded EML to PDF: {att_filename}")
                         except Exception as eml_e:
                             logger.warning(f"Error converting embedded EML {att_filename} to PDF: {eml_e}")
+                    elif _looks_like_image(att_content_type, att_filename):
+                        img_data = att.get('data') or b''
+                        if not isinstance(img_data, (bytes, bytearray)):
+                            try:
+                                img_data = bytes(img_data)
+                            except Exception:
+                                logger.warning(
+                                    "Skipping image attachment %s from msg_attachments; payload is not bytes",
+                                    att_filename,
+                                )
+                                continue
+                        if not img_data:
+                            logger.warning(f"Skipping empty image attachment {att_filename}")
+                            continue
+                        pdf_bytes, page_count = _convert_image_bytes_to_pdf(img_data, att_filename)
+                        if not pdf_bytes:
+                            logger.warning(f"Failed to convert image attachment {att_filename} to PDF")
+                            continue
+
+                        out_name = os.path.splitext(att_filename or f"attachment-{len(pdf_attachments)+1}")[0] + '.pdf'
+                        if out_name.lower() in converted_image_keys:
+                            logger.info(
+                                "Skipping duplicate image attachment %s already converted to PDF",
+                                out_name,
+                            )
+                            continue
+                        pdf_attachments.append({
+                            'filename': out_name,
+                            'content_type': 'application/pdf',
+                            'data': pdf_bytes
+                        })
+                        converted_image_keys.add(out_name.lower())
+                        logger.info(
+                            "Converted image attachment %s to PDF (%d page%s, %d bytes)",
+                            out_name,
+                            page_count,
+                            's' if page_count != 1 else '',
+                            len(pdf_bytes),
+                        )
                     elif att.get('content_type') == 'text/plain' and str(att.get('filename', '')).lower().endswith('.txt'):
                         # Convert embedded message text to PDF
                         try:
@@ -1781,10 +2538,45 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
                 pdf_start = time.time()
                 logger.info(f"Starting PDF generation to: {output_path}")
                 page_format, page_margins = _resolve_pdf_layout_settings()
+                # Use minimal margins for better content flow
+                pdf_margins = page_margins.copy()
+                pdf_margins['top'] = '0.3in'  # Further reduced
+                pdf_margins['bottom'] = '0.3in'  # Further reduced
+                pdf_margins['left'] = '0.5in'  # Slightly reduced
+                pdf_margins['right'] = '0.5in'  # Slightly reduced
+                
+                logger.info(f"PAGE BREAK DIAGNOSTIC: Using minimal PDF margins: {pdf_margins}")
+                
+                # Add page evaluation for debugging
+                try:
+                    page_info = page.evaluate("""
+                        () => {
+                            const header = document.querySelector('.email-header');
+                            const body = document.querySelector('.email-body');
+                            const first = body && body.firstElementChild ? body.firstElementChild : null;
+                            const cs = first ? window.getComputedStyle(first) : null;
+                            return {
+                                headerHeight: header ? header.offsetHeight : 0,
+                                bodyHeight: body ? body.offsetHeight : 0,
+                                totalHeight: document.body.scrollHeight,
+                                viewportHeight: window.innerHeight,
+                                headerDisplay: header ? window.getComputedStyle(header).display : 'none',
+                                bodyDisplay: body ? window.getComputedStyle(body).display : 'none',
+                                firstBodyTag: first ? first.tagName : null,
+                                firstBodyStyle: first ? (first.getAttribute('style') || '') : null,
+                                firstBreakBefore: cs ? (cs.breakBefore || cs.pageBreakBefore || null) : null,
+                                firstBreakAfter: cs ? (cs.breakAfter || cs.pageBreakAfter || null) : null
+                            };
+                        }
+                    """)
+                    logger.info(f"PAGE BREAK DIAGNOSTIC: Page layout info: {page_info}")
+                except Exception as eval_e:
+                    logger.warning(f"Page evaluation failed: {eval_e}")
+                
                 page.pdf(
                     path=output_path,
                     format=page_format,
-                    margin=page_margins,
+                    margin=pdf_margins,
                     print_background=True,
                     prefer_css_page_size=False,
                     display_header_footer=False
