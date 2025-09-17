@@ -7,7 +7,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Default values
 ENVIRONMENT="dev"
-REGION="us-east-1"
+REGION=""
 PASSWORD=""
 INLINE_REMOTE_IMAGES="false"
 PROFILE=""
@@ -42,9 +42,30 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+ACTIVE_PROFILE="${PROFILE:-${AWS_PROFILE:-}}"
+
 if [ -n "${PROFILE}" ]; then
   export AWS_PROFILE="${PROFILE}"
   echo "Using AWS profile: ${AWS_PROFILE}"
+fi
+
+if [ -z "${REGION}" ]; then
+  if [ -n "${AWS_REGION}" ]; then
+    REGION="${AWS_REGION}"
+  elif [ -n "${AWS_DEFAULT_REGION}" ]; then
+    REGION="${AWS_DEFAULT_REGION}"
+  else
+    if [ -n "${ACTIVE_PROFILE}" ]; then
+      REGION="$(aws configure get region --profile "${ACTIVE_PROFILE}" 2>/dev/null || true)"
+    else
+      REGION="$(aws configure get region 2>/dev/null || true)"
+    fi
+  fi
+fi
+
+if [ -z "${REGION}" ]; then
+  echo "Error: Unable to determine AWS region. Set AWS_REGION or pass --region." >&2
+  exit 1
 fi
 
 echo "Deploying container-based solution for environment: $ENVIRONMENT"

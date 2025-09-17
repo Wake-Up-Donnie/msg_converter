@@ -4,18 +4,19 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 ENVIRONMENT="test"
-REGION="us-east-1"
+REGION=""
 PASSWORD=""
 INLINE_REMOTE_IMAGES="false"
 PROFILE=""
 DELETE_STACK=0
+USER_SET_REGION=0
 
 usage() {
   cat <<USAGE
 Usage: $(basename "$0") [options]
 
 Options:
-  --region <aws-region>          AWS region to deploy to (default: ${REGION})
+  --region <aws-region>          AWS region to deploy to (defaults to AWS_REGION/AWS_DEFAULT_REGION)
   --password <password>          Optional password to protect the test UI
   --inline-remote-images <bool>  Enable or disable inlining remote images (default: ${INLINE_REMOTE_IMAGES})
   --profile <aws-profile>        AWS profile to use for all CLI commands
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --region)
       REGION="$2"
+      USER_SET_REGION=1
       shift 2
       ;;
     --password)
@@ -61,9 +63,30 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+ACTIVE_PROFILE="${PROFILE:-${AWS_PROFILE:-}}"
+
 if [[ -n "${PROFILE}" ]]; then
   export AWS_PROFILE="${PROFILE}"
   echo "Using AWS profile: ${AWS_PROFILE}"
+fi
+
+if [[ -z "${REGION}" ]]; then
+  if [[ -n "${AWS_REGION}" ]]; then
+    REGION="${AWS_REGION}"
+  elif [[ -n "${AWS_DEFAULT_REGION}" ]]; then
+    REGION="${AWS_DEFAULT_REGION}"
+  else
+    if [[ -n "${ACTIVE_PROFILE}" ]]; then
+      REGION="$(aws configure get region --profile "${ACTIVE_PROFILE}" 2>/dev/null || true)"
+    else
+      REGION="$(aws configure get region 2>/dev/null || true)"
+    fi
+  fi
+fi
+
+if [[ -z "${REGION}" ]]; then
+  echo "Error: Unable to determine AWS region. Set AWS_REGION or pass --region." >&2
+  exit 1
 fi
 
 STACK_NAME="eml-converter-${ENVIRONMENT}"
@@ -133,4 +156,8 @@ fi
 echo "\nUse './aws/get_api_urls.sh ${ENVIRONMENT}' to reprint these URLs."
 
 echo "To delete everything created for this test run:"
-echo "  ${SCRIPT_DIR}/$(basename "$0") --region ${REGION} --delete"
+if [[ ${USER_SET_REGION} -eq 1 ]]; then
+  echo "  ${SCRIPT_DIR}/$(basename "$0") --region ${REGION} --delete"
+else
+  echo "  ${SCRIPT_DIR}/$(basename "$0") --delete"
+fi
