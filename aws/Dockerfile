@@ -1,16 +1,19 @@
-# Lambda base (Amazon Linux)
-FROM public.ecr.aws/lambda/python:3.11
+# Lambda base (Amazon Linux 2023 w/ glibc 2.34)
+FROM public.ecr.aws/lambda/python:3.12
 
 # ---------- System packages ----------
-# perl, build tools (for CPAN if needed), fonts/libs for wkhtmltopdf, wget, tar, xz
-# diskspacecheck=0 sidesteps the false "0 free" overlayfs reading on macOS Docker builds
-RUN mkdir -p /tmp/yum-cache \
- && yum --setopt=tsflags=nodocs --setopt=cachedir=/tmp/yum-cache --setopt=diskspacecheck=0 install -y \
+# Install the minimal native tooling needed for Perl modules and wkhtmltopdf.
+RUN dnf install -y \
     perl \
-    perl-CPAN \
     make \
-    gcc \
-    xorg-x11-fonts-Type1 \
+    tar \
+    xz \
+    gzip \
+    curl \
+    wget \
+    fontconfig \
+    freetype \
+    urw-base35-fonts \
     libX11 \
     libXext \
     libXrender \
@@ -20,18 +23,17 @@ RUN mkdir -p /tmp/yum-cache \
     libXdamage \
     libXcomposite \
     libXinerama \
-    fontconfig \
-    freetype \
-    urw-fonts \
-    wget \
-    tar \
-    xz \
- && yum clean all \
- && rm -rf /tmp/yum-cache
+    xorg-x11-fonts-Type1 \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
 
 # ---------- Install Email::Outlook::Message (provides msgconvert) ----------
-# (cpan is interactive by default; force non-interactive)
-RUN PERL_MM_USE_DEFAULT=1 cpan -i Email::Outlook::Message
+# Use cpanminus to pull the module and its pure-Perl dependencies into /opt/perl.
+ENV PERL5LIB=/opt/perl/lib/perl5
+ENV PATH=/opt/perl/bin:$PATH
+RUN curl -L https://cpanmin.us | perl - --notest --local-lib=/opt/perl App::cpanminus \
+ && /opt/perl/bin/cpanm --notest --local-lib=/opt/perl Email::Outlook::Message \
+ && ln -s /opt/perl/bin/msgconvert /usr/local/bin/msgconvert
 
 # ---------- Install wkhtmltopdf (Lambda-friendly build) ----------
 # 0.12.4 is a commonly used static build that plays nicely in Lambda images
