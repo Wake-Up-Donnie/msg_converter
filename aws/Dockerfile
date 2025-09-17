@@ -13,8 +13,18 @@ RUN pip3 install --upgrade pip
 
 # ---- Python deps ----
 COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip3 install -r /tmp/requirements.txt \
-    && pip3 install playwright==1.54.0
+
+# The base Lambda image already bundles boto3/botocore, but the bundled
+# versions live in the small `/var/lang` partition.  When pip tries to upgrade
+# them it first stages the uninstall, which exhausts the partition and causes a
+# "No space left on device" failure during container builds.  Eagerly removing
+# the preinstalled copies keeps enough headroom for the pinned versions in our
+# requirements to install successfully.
+RUN rm -rf /var/lang/lib/python3.12/site-packages/boto3* \
+           /var/lang/lib/python3.12/site-packages/botocore* \
+           /var/lang/lib/python3.12/site-packages/s3transfer* \
+           /var/lang/lib/python3.12/site-packages/jmespath* \
+    && pip3 install -r /tmp/requirements.txt
 
 # ---- System deps for headless Chromium on Amazon Linux 2023 ----
 # AL2023 uses dnf/microdnf (not apt). Install the libraries Chromium needs.
