@@ -71,9 +71,9 @@ if [[ -n "${PROFILE}" ]]; then
 fi
 
 if [[ -z "${REGION}" ]]; then
-  if [[ -n "${AWS_REGION}" ]]; then
+  if [[ -n "${AWS_REGION:-}" ]]; then
     REGION="${AWS_REGION}"
-  elif [[ -n "${AWS_DEFAULT_REGION}" ]]; then
+  elif [[ -n "${AWS_DEFAULT_REGION:-}" ]]; then
     REGION="${AWS_DEFAULT_REGION}"
   else
     if [[ -n "${ACTIVE_PROFILE}" ]]; then
