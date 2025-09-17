@@ -3,8 +3,9 @@ FROM public.ecr.aws/lambda/python:3.11
 
 # ---------- System packages ----------
 # perl, build tools (for CPAN if needed), fonts/libs for wkhtmltopdf, wget, tar, xz
+# diskspacecheck=0 sidesteps the false "0 free" overlayfs reading on macOS Docker builds
 RUN mkdir -p /tmp/yum-cache \
- && yum --setopt=tsflags=nodocs --setopt=cachedir=/tmp/yum-cache install -y \
+ && yum --setopt=tsflags=nodocs --setopt=cachedir=/tmp/yum-cache --setopt=diskspacecheck=0 install -y \
     perl \
     perl-CPAN \
     make \
