@@ -8,18 +8,10 @@ import logging
 from typing import Dict, Any
 import email
 from email.policy import default
-from email.header import decode_header
 from email.message import EmailMessage
 from email.generator import BytesGenerator
-from email.utils import (
-    parseaddr,
-    parsedate_to_datetime,
-    format_datetime,
-    getaddresses,
-    formataddr,
-)
+from email.utils import parseaddr, parsedate_to_datetime
 from datetime import datetime, timezone
-import io
 import html
 from html.parser import HTMLParser
 import re
@@ -30,11 +22,41 @@ from pypdf import PdfReader, PdfWriter
 import shutil
 import subprocess
 from pathlib import Path
+
 from converter import EmailConverter
 from router import LambdaRouter
 from document_converter import DocumentConverter
 from request_parser import RequestParser
 from multipart_parser import MultipartParser
+
+from logging_utils import configure_logging
+from pdf_settings import resolve_pdf_layout_settings
+from html_processing import (
+    clean_html_content,
+    extract_style_blocks,
+    normalize_body_html_fragment,
+    normalize_whitespace,
+    sanitize_style_block_css,
+    strip_word_section_wrappers,
+)
+from image_processing import (
+    convert_image_bytes_to_pdf,
+    ensure_displayable_image_bytes,
+    inline_image_attachments_into_body,
+    looks_like_image,
+    normalize_lookup_key,
+    normalize_url,
+    replace_image_references,
+)
+from email_metadata import (
+    build_sender_value_html,
+    extract_display_date,
+    format_address_header,
+    format_address_header_compact,
+    safe_decode_header,
+)
+from email_body_processing import extract_body_and_images_from_email, get_part_content
+from email_header import collect_header_context
 
 
 ############################################
@@ -45,31 +67,7 @@ from multipart_parser import MultipartParser
 ############################################
 
 
-def _configure_logging():
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    root = logging.getLogger()
-
-    # Always set the root level explicitly (Lambda default can be WARNING)
-    try:
-        root.setLevel(getattr(logging, log_level, logging.INFO))
-    except Exception:
-        root.setLevel(logging.INFO)
-
-    # If there are no handlers (e.g., local run) add a StreamHandler
-    if not root.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s %(levelname)s [%(name)s] %(message)s'
-        )
-        handler.setFormatter(formatter)
-        root.addHandler(handler)
-
-    # Quiet overly chatty libraries unless overridden
-    logging.getLogger('boto3').setLevel(logging.WARNING)
-    logging.getLogger('botocore').setLevel(logging.WARNING)
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-
-_configure_logging()
+configure_logging()
 logger = logging.getLogger(__name__)
 logger.debug("Logging configured: level=%s, handlers=%s", logging.getLevelName(logger.level), len(logging.getLogger().handlers))
 
@@ -77,43 +75,21 @@ converter = EmailConverter(logger)
 doc_converter = DocumentConverter(logger)
 multipart_parser = MultipartParser(logger)
 
-# Default PDF layout settings (can be overridden via environment variables)
-DEFAULT_PDF_PAGE_FORMAT = "Letter"
-PDF_PAGE_FORMAT_ENV_KEYS = (
-    "PDF_PAGE_FORMAT",
-    "PDF_PAGE_SIZE",
-    "PAGE_FORMAT",
-    "PAGE_SIZE",
-)
-PDF_PAGE_FORMAT_ALIASES = {
-    "LETTER": "Letter",
-    "US-LETTER": "Letter",
-    "US_LETTER": "Letter",
-    "A4": "A4",
-    "LEGAL": "Legal",
-    "A3": "A3",
-    "TABLOID": "Tabloid",
-}
-PDF_DEFAULT_MARGINS = {
-    "Letter": {
-        "top": "0.75in",
-        "right": "0.75in",
-        "bottom": "0.75in",
-        "left": "0.75in",
-    },
-    "A4": {
-        "top": "1in",
-        "right": "1in",
-        "bottom": "1in",
-        "left": "1in",
-    },
-    "Legal": {
-        "top": "1in",
-        "right": "1in",
-        "bottom": "1in",
-        "left": "1in",
-    },
-}
+# Backward compatibility aliases for legacy imports
+_safe_decode_header = safe_decode_header
+_format_address_header = format_address_header
+_format_address_header_compact = format_address_header_compact
+_build_sender_value_html = build_sender_value_html
+_extract_display_date = extract_display_date
+_sanitize_style_block_css = sanitize_style_block_css
+_extract_style_blocks = extract_style_blocks
+_strip_word_section_wrappers = strip_word_section_wrappers
+_inline_image_attachments_into_body = inline_image_attachments_into_body
+_ensure_displayable_image_bytes = ensure_displayable_image_bytes
+_convert_image_bytes_to_pdf = convert_image_bytes_to_pdf
+_normalize_key = normalize_lookup_key
+_normalize_url = normalize_url
+_looks_like_image = looks_like_image
 
 
 def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
@@ -124,84 +100,6 @@ def convert_msg_bytes_to_eml_bytes(msg_bytes: bytes) -> bytes:
 def convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes: bytes) -> tuple[bytes, list]:
     """Wrapper providing backward compatibility for attachment extraction."""
     return converter.convert_msg_bytes_to_eml_bytes_with_attachments(msg_bytes)
-# =====================
-# PDF layout helpers
-# =====================
-
-
-def _standardize_page_key(value: str | None) -> str:
-    if not value:
-        return ""
-    return re.sub(r"[^A-Z0-9]+", "-", value.upper()).strip('-')
-
-
-def _normalize_margin_value(value: str | None, fallback: str, side: str) -> str:
-    if value is None:
-        return fallback
-
-    candidate = str(value).strip()
-    if not candidate:
-        return fallback
-
-    lower_candidate = candidate.lower()
-    if lower_candidate.endswith(("in", "cm", "mm", "px")):
-        return candidate
-
-    if re.fullmatch(r"\d+(?:\.\d+)?", candidate):
-        normalized = f"{candidate}in"
-        logger.debug("Normalized numeric margin for %s side: %s -> %s", side, candidate, normalized)
-        return normalized
-
-    logger.warning(
-        "Invalid margin value '%s' for %s side. Falling back to %s.",
-        value,
-        side,
-        fallback,
-    )
-    return fallback
-
-
-def _resolve_pdf_layout_settings() -> tuple[str, dict[str, str]]:
-    page_format = DEFAULT_PDF_PAGE_FORMAT
-    source_env_key = None
-    raw_value = None
-
-    for key in PDF_PAGE_FORMAT_ENV_KEYS:
-        val = os.environ.get(key)
-        if val:
-            source_env_key = key
-            raw_value = val.strip()
-            break
-
-    if raw_value:
-        normalized_key = _standardize_page_key(raw_value)
-        resolved = PDF_PAGE_FORMAT_ALIASES.get(normalized_key)
-        if resolved:
-            page_format = resolved
-        else:
-            page_format = raw_value
-            logger.warning(
-                "Unrecognized PDF page format '%s' from %s; passing through to Playwright.",
-                raw_value,
-                source_env_key,
-            )
-
-    margins = PDF_DEFAULT_MARGINS.get(page_format, PDF_DEFAULT_MARGINS.get(DEFAULT_PDF_PAGE_FORMAT, {})).copy()
-
-    general_margin = os.environ.get('PDF_MARGIN')
-    if general_margin:
-        normalized_general = _normalize_margin_value(general_margin, margins.get('top', '1in'), 'all')
-        for side in ('top', 'right', 'bottom', 'left'):
-            margins[side] = normalized_general
-
-    for side in ('top', 'right', 'bottom', 'left'):
-        env_key = f'PDF_MARGIN_{side.upper()}'
-        side_value = os.environ.get(env_key)
-        if side_value:
-            margins[side] = _normalize_margin_value(side_value, margins[side], side)
-
-    logger.info("Using PDF page format '%s' with margins %s", page_format, margins)
-    return page_format, margins
 # Initialize S3 client
 s3_client = boto3.client('s3')
 S3_BUCKET = os.environ.get('S3_BUCKET')
@@ -228,1375 +126,6 @@ def eml_bytes_to_pdf_bytes(eml_bytes: bytes) -> bytes | None:
 # =====================
 
 # =====================
-
-def get_part_content(part):
-    """Safely extract content from email part with fallback methods"""
-    try:
-        if hasattr(part, 'get_content'):
-            return part.get_content()
-
-        payload = part.get_payload(decode=True)
-        if payload:
-            charset = part.get_content_charset() or 'utf-8'
-            try:
-                return payload.decode(charset)
-            except (UnicodeDecodeError, LookupError):
-                for enc in ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']:
-                    try:
-                        return payload.decode(enc)
-                    except (UnicodeDecodeError, LookupError):
-                        continue
-                return payload.decode('utf-8', errors='replace')
-
-        payload = part.get_payload()
-        if isinstance(payload, str):
-            return payload
-        return None
-    except Exception as e:
-        logger.warning(f"Error extracting content from email part: {str(e)}")
-        try:
-            payload = part.get_payload()
-            if isinstance(payload, str):
-                return payload
-            elif isinstance(payload, bytes):
-                return payload.decode('utf-8', errors='replace')
-        except Exception as e2:
-            logger.error(f"Failed to extract content with fallback: {str(e2)}")
-        return None
-
-def _sanitize_css_values(prop: str, value: str) -> str:
-    """Return a safe value for CSS break properties.
-
-    Any explicit page/column break requests are neutralized to 'auto'. We keep
-    'avoid' only for the *inside* variants which helps keep elements together
-    without forcing a new page.
-    """
-    try:
-        p = (prop or '').strip().lower()
-        v = (value or '').strip().lower()
-
-        if not p:
-            return value
-
-        if p == 'page':
-            return 'auto'
-
-        # Tokens that trigger a new page/column and should be removed
-        hard_break_tokens = (
-            'always', 'page', 'left', 'right', 'recto', 'verso', 'column'
-        )
-
-        if any(t in v for t in hard_break_tokens):
-            if p.endswith('inside'):
-                # Prefer auto over avoid when hard tokens are present in 'inside'
-                return 'auto'
-            # Neutralize before/after hard breaks
-            return 'auto'
-
-        if p.startswith('mso-') and 'page' in p:
-            return 'auto'
-
-        # Keep existing values otherwise
-        return value
-    except Exception:
-        return value
-
-
-def _sanitize_style_block_css(css_text: str) -> tuple[str, int]:
-    """Sanitize a full <style> block's CSS and return (sanitized, replacements).
-
-    Replaces any page/column break directives that could cause the body to
-    start on a new page (e.g. 'break-before: page', 'page-break-after: always').
-    """
-    try:
-        replacements = 0
-
-        def repl(m: re.Match) -> str:
-            nonlocal replacements
-            prop = m.group('prop')
-            value = m.group('value')
-            safe = _sanitize_css_values(prop, value)
-            if safe != value:
-                replacements += 1
-            return f"{m.group('prop')}{m.group('separator')}{safe}{m.group('suffix')}"
-
-        # Generic matcher for break-related properties
-        pattern = re.compile(
-            r"(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside|page|mso-page)"
-            r"(?P<separator>\s*:\s*)(?P<value>[^;}{]+)(?P<suffix>;?)",
-            flags=re.IGNORECASE,
-        )
-        sanitized = pattern.sub(repl, css_text or "")
-
-        # Remove @page declarations which can enforce page breaks via named sections
-        page_pattern = re.compile(r'@page\s+[^{}]*\{[^{}]*\}', flags=re.IGNORECASE | re.DOTALL)
-        sanitized, page_block_count = page_pattern.subn('', sanitized)
-        if page_block_count:
-            replacements += page_block_count
-            logger.info("SANITIZER: Removed %s @page declaration(s)", page_block_count)
-
-        return sanitized, replacements
-    except Exception:
-        return css_text, 0
-
-
-def clean_html_content(html_content: str, style_collector: list[str] | None = None) -> str:
-    """Basic HTML sanitation and cleanup.
-
-    Optionally collects <style> blocks before they are stripped so the caller can
-    reattach them later in a safe context.
-    """
-    try:
-        if style_collector is not None:
-            styles = re.findall(r'<style[^>]*>.*?</style>', html_content, flags=re.DOTALL | re.IGNORECASE)
-            if styles:
-                style_collector.extend(styles)
-        html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-        html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-        html_content = re.sub(r'\s*on\w+\s*=\s*["\'][^"\']*["\']', '', html_content, flags=re.IGNORECASE)
-        html_content = re.sub(r'\s*javascript\s*:', '', html_content, flags=re.IGNORECASE)
-        html_content = re.sub(r'<o:p[^>]*>.*?</o:p>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-        html_content = re.sub(r'<!\[if[^>]*>.*?<!\[endif\]>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-
-        style_attr_pattern = re.compile(
-            r"""(\sstyle\s*=\s*)(?P<quote>["'])(?P<content>.*?)(?P=quote)""",
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        inline_page_break_pattern = re.compile(
-            r"(?P<prop>page-break-before|page-break-after|page-break-inside|break-before|break-after|break-inside|page)"
-            r"(?P<separator>\s*:\s*)(?P<value>[^;]*)(?P<suffix>;?)",
-            flags=re.IGNORECASE,
-        )
-
-        def _sanitize_style_content(style_content: str) -> str:
-            def _replace(match: re.Match[str]) -> str:
-                value = match.group('value')
-                prop_name = match.group('prop').lower()
-                safe = _sanitize_css_values(prop_name, value)
-                # If we changed the value, great; otherwise keep as-is
-                return f"{match.group('prop')}{match.group('separator')}{safe}{match.group('suffix')}"
-
-            return inline_page_break_pattern.sub(_replace, style_content)
-
-        def _sanitize_style_attribute(match):
-            prefix = match.group(1)
-            quote = match.group('quote')
-            content = match.group('content')
-            sanitized_content = _sanitize_style_content(content)
-            return f"{prefix}{quote}{sanitized_content}{quote}"
-
-        # Sanitize inline style attributes
-        html_content = style_attr_pattern.sub(_sanitize_style_attribute, html_content)
-
-        # Additionally, if we're collecting <style> blocks, sanitize them in place
-        if style_collector is not None and style_collector:
-            sanitized_blocks: list[str] = []
-            total_replacements = 0
-            for block in style_collector:
-                try:
-                    # Extract inner CSS of the style tag
-                    inner = re.sub(r'^<style[^>]*>|</style>$', '', block, flags=re.IGNORECASE).strip()
-                    inner_sanitized, reps = _sanitize_style_block_css(inner)
-                    total_replacements += reps
-                    sanitized_blocks.append(f"<style>\n{inner_sanitized}\n</style>")
-                except Exception:
-                    sanitized_blocks.append(block)
-            # Replace the collector contents with sanitized versions so later
-            # reattachment uses the safe CSS
-            style_collector.clear()
-            style_collector.extend(sanitized_blocks)
-            if total_replacements:
-                logger.info(f"SANITIZER: Neutralized {total_replacements} break directive(s) in <style> blocks")
-        return html_content
-    except Exception as e:
-        logger.warning(f"Error cleaning HTML content: {str(e)}")
-        return html.escape(str(html_content)).replace('\n', '<br>\n')
-
-
-def _extract_style_blocks(html_content: str | None) -> tuple[str, list[str]]:
-    """Return HTML content without <style> tags and a list of the extracted blocks."""
-    if not html_content:
-        return html_content or "", []
-
-    try:
-        styles = re.findall(r'<style[^>]*>.*?</style>', html_content, flags=re.DOTALL | re.IGNORECASE)
-        if not styles:
-            return html_content, []
-        cleaned_html = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-        return cleaned_html, styles
-    except Exception as e:
-        logger.warning(f"Error extracting <style> blocks: {str(e)}")
-        return html_content, []
-
-def normalize_whitespace(html_content: str) -> str:
-    """Aggressively normalize whitespace to prevent rendering gaps and fix typography ligatures in URLs/text."""
-    if not html_content:
-        return ""
-    # Stage 0: Normalize Unicode compatibility forms (e.g., turn 'ﬀ' into 'ff')
-    try:
-        import unicodedata
-        html_content = unicodedata.normalize('NFKC', html_content)
-    except Exception:
-        pass
-    # Stage 1: Normalize all forms of spaces and invisible characters
-    # Replace non-breaking spaces, various Unicode spaces, and tabs with a regular space
-    content = html_content.replace('&nbsp;', ' ')
-    content = re.sub(r'[\u00A0\u2000-\u200B\u202F\u205F\u3000\t]', ' ', content)
-    # Remove zero-width characters that can affect layout
-    content = content.replace('\u200B', '').replace('\uFEFF', '')
-    # Also strip WORD JOINER and SOFT HYPHEN
-    content = content.replace('\u2060', '').replace('\u00AD', '')
-    # Convert visible escape sequences into actual newlines before collapsing
-    content = content.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\r', '\n')
-
-    # Stage 2: Collapse spacing
-    # Collapse multiple spaces into a single space
-    content = re.sub(r' {2,}', ' ', content)
-    # Replace newlines with a single space to prevent them from creating layout gaps
-    content = re.sub(r'[\r\n]+', ' ', content)
-    
-    # Trim leading/trailing whitespace from the entire block
-    return content.strip()
-
-
-# --- Helper: remove Word-specific wrapper divs/classes that force page breaks ---
-def _strip_word_section_wrappers(html_fragment: str) -> tuple[str, dict[str, int]]:
-    if not html_fragment:
-        return html_fragment, {'wrappers_removed': 0, 'class_refs_removed': 0}
-
-    content = html_fragment.strip()
-    wrappers_removed = 0
-
-    # Remove outer <div class="WordSectionX"> wrappers introduced by Word export
-    wrapper_pattern = re.compile(
-        r'^\s*<div\b([^>]*)class\s*=\s*(["\"])'  # opening <div ... class="
-        r'(?P<classes>[^"\'>]*wordsection[^"\'>]*)\2([^>]*)>'
-        r'(?P<inner>.*)</div>\s*$',
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # Iteratively unwrap up to a reasonable depth to avoid catastrophic backtracking
-    for _ in range(5):
-        m = wrapper_pattern.match(content)
-        if not m:
-            break
-        inner = m.group('inner').strip()
-        if not inner:
-            break
-        content = inner
-        wrappers_removed += 1
-
-    class_refs_removed = 0
-
-    def _class_replacer(match: re.Match) -> str:
-        nonlocal class_refs_removed
-        quote = match.group(1)
-        classes_raw = match.group(2)
-        classes = re.split(r'\s+', classes_raw.strip()) if classes_raw.strip() else []
-        filtered = [c for c in classes if 'wordsection' not in c.lower()]
-        removed = len(classes) - len(filtered)
-        class_refs_removed += removed
-        if not filtered:
-            return ''
-        return f' class={quote}{" ".join(filtered)}{quote}'
-
-    class_pattern = re.compile(r'\sclass\s*=\s*(["\'])([^"\']*)(\1)', flags=re.IGNORECASE)
-    content = class_pattern.sub(_class_replacer, content)
-
-    return content, {
-        'wrappers_removed': wrappers_removed,
-        'class_refs_removed': class_refs_removed,
-    }
-
-
-IMAGE_ATTACHMENT_EXTENSIONS = (
-    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic', '.heif'
-)
-
-SUPPORTED_INLINE_IMAGE_TYPES = {
-    'image/png',
-    'image/jpeg',
-    'image/jpg',
-    'image/gif',
-    'image/webp',
-    'image/bmp',
-    'image/svg+xml',
-}
-
-
-def _looks_like_image(content_type: str | None, filename: str | None) -> bool:
-    ctype = (content_type or '').lower()
-    if ctype.startswith('image/'):
-        return True
-    if filename and filename.lower().endswith(IMAGE_ATTACHMENT_EXTENSIONS):
-        return True
-    return False
-
-
-def _ensure_displayable_image_bytes(img_bytes, content_type, source_name: str | None = None) -> tuple[bytes | None, str | None]:
-    """Return (image_bytes, content_type) convertible for browser display (prefer PNG)."""
-    if not isinstance(img_bytes, (bytes, bytearray)) or not img_bytes:
-        return None, content_type
-
-    normalized_ct = (content_type or '').lower()
-    if normalized_ct in SUPPORTED_INLINE_IMAGE_TYPES:
-        return bytes(img_bytes), normalized_ct or 'image/png'
-
-    label = source_name or 'inline image'
-    try:
-        from PIL import Image
-    except Exception as import_err:
-        logger.warning(
-            "Unable to import Pillow for converting %s (%s); rendering may fail: %s",
-            label,
-            normalized_ct or 'unknown',
-            import_err,
-        )
-        return bytes(img_bytes), content_type or 'application/octet-stream'
-
-    try:
-        with Image.open(io.BytesIO(img_bytes)) as pil_img:
-            try:
-                if getattr(pil_img, 'n_frames', 1) > 1:
-                    pil_img.seek(0)
-            except Exception:
-                pass
-
-            if pil_img.mode in ('P', 'PA', 'LA', 'RGBA'):
-                pil_img = pil_img.convert('RGBA')
-            elif pil_img.mode not in ('RGB', 'L'):
-                pil_img = pil_img.convert('RGB')
-
-            buffer = io.BytesIO()
-            save_mode = 'PNG'
-            pil_img.save(buffer, format=save_mode)
-            converted = buffer.getvalue()
-            logger.info(
-                "Converted inline image %s from %s to image/png for browser rendering",
-                label,
-                normalized_ct or 'unknown',
-            )
-            return converted, 'image/png'
-    except Exception as convert_err:
-        logger.warning(
-            "Failed to convert inline image %s (%s) to PNG: %s",
-            label,
-            normalized_ct or 'unknown',
-            convert_err,
-        )
-    return bytes(img_bytes), content_type or 'application/octet-stream'
-
-
-def _convert_image_bytes_to_pdf(image_bytes: bytes, source_name: str | None = None) -> tuple[bytes | None, int]:
-    """Convert raw image bytes into a PDF. Returns (pdf_bytes, page_count)."""
-    if not isinstance(image_bytes, (bytes, bytearray)) or not image_bytes:
-        return None, 0
-
-    try:
-        from PIL import Image, ImageSequence
-    except Exception as import_err:
-        logger.warning(
-            "Image->PDF conversion requires Pillow; skipping %s: %s",
-            source_name or 'image attachment',
-            import_err,
-        )
-        return None, 0
-
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            frames = []
-            try:
-                iterator = ImageSequence.Iterator(img)
-            except Exception:
-                iterator = [img]
-
-            for frame in iterator:
-                converted = frame.convert('RGB') if frame.mode != 'RGB' else frame.copy()
-                frames.append(converted.copy())
-
-            if not frames:
-                frames.append(img.convert('RGB'))
-
-            buffer = io.BytesIO()
-            first = frames[0]
-            rest = frames[1:]
-            if rest:
-                first.save(buffer, format='PDF', save_all=True, append_images=rest)
-            else:
-                first.save(buffer, format='PDF')
-
-            for f in frames:
-                try:
-                    f.close()
-                except Exception:
-                    pass
-
-            pdf_data = buffer.getvalue()
-            page_count = 1 + len(rest)
-            return pdf_data, page_count
-    except Exception as convert_err:
-        logger.warning(
-            "Failed to convert image attachment %s to PDF: %s",
-            source_name or 'image attachment',
-            convert_err,
-        )
-        return None, 0
-
-
-# --- Helper: normalize image lookup keys (NFKC, strip zero-width, collapse spaces) ---
-def _normalize_key(s: str) -> str:
-    """Normalize strings used as image lookup keys: NFKC + strip zero-width + collapse spaces."""
-    try:
-        import unicodedata, re
-        x = unicodedata.normalize('NFKC', s or "")
-        # Remove zero-width and soft hyphen characters
-        x = x.replace("\u200B", "").replace("\uFEFF", "").replace("\u2060", "").replace("\u00AD", "")
-        # Remove all whitespace
-        x = re.sub(r"\s+", "", x)
-        return x
-    except Exception:
-        return s or ""
-
-
-def _normalize_url(u: str) -> str:
-    """Decode percent-encodings, NFKC-normalize ligatures (e.g., \uFB00 -> 'ff'), strip zero-width chars, then re-encode.
-    Keeps scheme/host untouched while cleaning path/query. Safe for problematic .gov links that contain ligatures.
-    """
-    try:
-        import unicodedata, urllib.parse, re
-        s = u or ""
-        parsed = urllib.parse.urlsplit(s)
-        # Decode path/query for normalization
-        path = urllib.parse.unquote(parsed.path or "")
-        query = urllib.parse.unquote(parsed.query or "")
-        # Normalize ligatures and compatibility forms
-        path = unicodedata.normalize('NFKC', path)
-        query = unicodedata.normalize('NFKC', query)
-        # Strip zero-width and soft hyphen
-        zap = dict.fromkeys(map(ord, "\u200B\uFEFF\u2060\u00AD"), None)
-        path = path.translate(zap)
-        query = query.translate(zap)
-        # Remove whitespace accidentally inserted inside URLs
-        path = re.sub(r"\s+", "", path)
-        query = re.sub(r"\s+", "", query)
-        # Rebuild URL with safely quoted components
-        new = urllib.parse.urlunsplit((
-            parsed.scheme,
-            parsed.netloc,
-            urllib.parse.quote(path, safe="/:@-._~!$&'()*+,;="),
-            urllib.parse.quote(query, safe="=&:@-._~!$'()*+,;"),
-            parsed.fragment
-        ))
-        return new
-    except Exception:
-        return (u or "").replace("\u200B", "").replace("\uFEFF", "").replace("\u2060", "").replace("\u00AD", "")
-
-
-_TRAILING_WS_RE = re.compile(r'(?:\s|&nbsp;|&#160;)+$', re.IGNORECASE)
-_TRAILING_BREAKS_RE = re.compile(r'(?:<br\s*/?>\s*)+$', re.IGNORECASE)
-_TRAILING_EMPTY_CONTAINER_RE = re.compile(
-    r'(?:<(?:div|p|span|font|section|article)[^>]*>(?:\s|&nbsp;|&#160;|<br\s*/?>)*</(?:div|p|span|font|section|article)>\s*)+$',
-    re.IGNORECASE,
-)
-_TRAILING_COMMENT_RE = re.compile(r'<!--[\s\S]*?-->\s*$', re.IGNORECASE)
-
-_LEADING_WS_RE = re.compile(r'^(?:\s|&nbsp;|&#160;)+', re.IGNORECASE)
-_LEADING_BREAKS_RE = re.compile(r'^(?:<br\s*/?>\s*)+', re.IGNORECASE)
-_LEADING_EMPTY_CONTAINER_RE = re.compile(
-    r'^(?:<(?:div|p|span|font|section|article)[^>]*>(?:\s|&nbsp;|&#160;|<br\s*/?>)*</(?:div|p|span|font|section|article)>\s*)+',
-    re.IGNORECASE,
-)
-_LEADING_COMMENT_RE = re.compile(r'^<!--[\s\S]*?-->\s*', re.IGNORECASE)
-
-
-def _strip_trailing_empty_html(fragment: str | None) -> str:
-    """Remove trailing whitespace, <br>, and empty block containers from an HTML fragment."""
-    if not fragment:
-        return ''
-
-    cleaned = fragment
-    while True:
-        updated = _TRAILING_COMMENT_RE.sub('', cleaned)
-        updated = _TRAILING_BREAKS_RE.sub('', updated)
-        updated = _TRAILING_EMPTY_CONTAINER_RE.sub('', updated)
-        updated = _TRAILING_WS_RE.sub('', updated)
-        if updated == cleaned:
-            break
-        cleaned = updated
-    return cleaned
-
-
-def _strip_leading_empty_html(fragment: str | None) -> str:
-    """Remove leading whitespace, <br>, and empty block containers from an HTML fragment."""
-    if not fragment:
-        return ''
-
-    cleaned = fragment
-    while True:
-        updated = _LEADING_COMMENT_RE.sub('', cleaned)
-        updated = _LEADING_BREAKS_RE.sub('', updated)
-        updated = _LEADING_EMPTY_CONTAINER_RE.sub('', updated)
-        updated = _LEADING_WS_RE.sub('', updated)
-        if updated == cleaned:
-            break
-        cleaned = updated
-    return cleaned
-
-
-def _normalize_body_html_fragment(fragment: str | None) -> str:
-    """Trim leading/trailing empty markup so visible content starts immediately."""
-    return _strip_trailing_empty_html(_strip_leading_empty_html(fragment))
-
-
-def _append_html_after_body_content(body_html: str | None, addition: str) -> str:
-    """Append ``addition`` immediately after the last non-empty body element."""
-    if not addition:
-        return body_html or ''
-
-    base = _normalize_body_html_fragment(body_html)
-    if not base:
-        return addition
-
-    separator = "" if base.endswith((">", "\n")) else "\n"
-    return base + separator + addition
-
-
-def _inline_image_attachments_into_body(
-    body_html: str,
-    attachment_list: list[dict],
-    source_label: str,
-) -> tuple[str, list[dict], list[str]]:
-    """Embed image attachments as inline <figure> elements inside the body HTML."""
-    if not attachment_list:
-        return body_html, attachment_list, []
-
-    remaining: list[dict] = []
-    inline_figures: list[str] = []
-    inlined_names: list[str] = []
-
-    for att in attachment_list:
-        fname = att.get('filename') or ''
-        ctype = att.get('content_type') or ''
-        data = att.get('data')
-        if not _looks_like_image(ctype, fname) or not isinstance(data, (bytes, bytearray)):
-            remaining.append(att)
-            continue
-
-        display_bytes, usable_type = _ensure_displayable_image_bytes(data, ctype, fname)
-        payload = display_bytes or bytes(data)
-        if not payload:
-            remaining.append(att)
-            continue
-
-        try:
-            b64 = base64.b64encode(payload).decode('utf-8')
-        except Exception as b64_err:
-            logger.warning(
-                "Failed to base64 inline image attachment %s (%s): %s",
-                fname,
-                usable_type or ctype or 'image',
-                b64_err,
-            )
-            remaining.append(att)
-            continue
-
-        alt_text = html.escape(fname or 'image attachment')
-        data_url = f"data:{usable_type or ctype or 'image/png'};base64,{b64}"
-        figure_html = (
-            f'<figure class="inline-attachment" data-source="{html.escape(source_label)}">'
-            f'<img src="{data_url}" alt="{alt_text}">' \
-            f'<figcaption>{alt_text}</figcaption></figure>'
-        )
-        inline_figures.append(figure_html)
-        inlined_names.append(fname or 'image attachment')
-
-    if inline_figures:
-        wrapper = (
-            '<div class="image-attachments">'
-            + ''.join(inline_figures)
-            + '</div>'
-        )
-        body_html = _append_html_after_body_content(body_html, wrapper)
-    return body_html, remaining, inlined_names
-
-def replace_image_references(html_content: str, images: Dict[str, str]) -> str:
-    """Replace <img src> values (cid:, filenames, content-location) with data URLs.
-    - Preserve unresolved external/data images
-    - Sanitize external URLs (fix ligatures/zero-width chars/line breaks)
-    - Optionally inline remote images as data URLs if INLINE_REMOTE_IMAGES=true
-    - Append unreferenced embedded images at the end
-    """
-    try:
-        used_data_urls = set()
-        stats = {"sanitized": 0, "inlined": 0}
-
-        # Build a normalized lookup that covers raw keys, NFKC/zero-width-stripped keys, and cleaned URLs
-        norm_images: Dict[str, str] = {}
-        for k, v in (images or {}).items():
-            if not k:
-                continue
-            norm_images[k] = v
-            nk = _normalize_key(str(k))
-            norm_images[nk] = v
-            kl = str(k).lower()
-            if kl.startswith('http://') or kl.startswith('https://'):
-                try:
-                    norm_images[_normalize_url(str(k))] = v
-                except Exception:
-                    pass
-
-        def sanitize_url(u: str) -> str:
-            try:
-                return _normalize_url(u or "")
-            except Exception:
-                return u or ""
-
-        def fetch_image_as_data_url(url: str) -> str | None:
-            """Fetch remote image and return as data URL; return None on any failure."""
-            try:
-                import urllib.request
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                      "(KHTML, like Gecko) Chrome/118 Safari/537.36",
-                        "Accept": "image/*"
-                    }
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    # Validate content type
-                    ctype = resp.headers.get("Content-Type", "")
-                    if not ctype.lower().startswith("image/"):
-                        return None
-                    # Read with a hard cap (5 MB)
-                    max_bytes = 5 * 1024 * 1024
-                    data = resp.read(max_bytes + 1)
-                    if len(data) > max_bytes:
-                        return None
-                    b64 = base64.b64encode(data).decode("utf-8")
-                    return f"data:{ctype};base64,{b64}"
-            except Exception:
-                return None
-
-        inline_remote_env = str(os.environ.get("INLINE_REMOTE_IMAGES", "true")).lower()
-        inline_remote = inline_remote_env not in ("0", "false", "no", "off")
-
-        def candidates_for(key: str):
-            key = (key or '').strip()
-            cands = []
-            if not key:
-                return cands
-            cands.append(key)
-
-            low = key.lower()
-            raw = key[4:] if low.startswith('cid:') else key
-
-            # Handle Outlook-style CIDs that include an "@suffix" (e.g., "image001.jpg@01DC...")
-            if '@' in raw:
-                base_at = raw.split('@', 1)[0]
-                if base_at:
-                    cands.append(base_at)
-                    if low.startswith('cid:'):
-                        cands.append(f'cid:{base_at}')
-
-            # Existing behavior: include raw (no "cid:" prefix) when starting with cid:
-            if low.startswith('cid:'):
-                cands.append(raw)
-
-            # Try to pull a filename; also consider pre-"@" base variant of that filename
-            try:
-                fname = key.split('?', 1)[0].split('#', 1)[0].split('/')[-1]
-                if fname and fname != key:
-                    cands.append(fname)
-                    if '@' in fname:
-                        fname_base = fname.split('@', 1)[0]
-                        if fname_base and fname_base != fname:
-                            cands.append(fname_base)
-                            if low.startswith('cid:'):
-                                cands.append(f'cid:{fname_base}')
-            except Exception:
-                pass
-
-            return cands
-
-        def replace_img_tag(m):
-            tag = m.group(0)
-            # Allow src to span multiple lines
-            msrc = re.search(r'src\s*=\s*(["\'])([\s\S]*?)\1', tag, flags=re.IGNORECASE | re.DOTALL)
-            if not msrc:
-                # No src attribute found; keep original tag to avoid content loss
-                return tag
-            orig = (msrc.group(2) or "").strip()
-
-            # First try to map to embedded images (cid/content-location/filename)
-            for lookup in (orig, sanitize_url(orig)):
-                for c in candidates_for(lookup):
-                    if c in norm_images:
-                        data_url = norm_images[c]
-                        used_data_urls.add(data_url)
-                        return re.sub(r'src\s*=\s*(["\'])([\s\S]*?)\1', f'src="{data_url}"', tag, flags=re.IGNORECASE | re.DOTALL)
-
-            low = orig.lower()
-            if low.startswith("http://") or low.startswith("https://"):
-                sanitized = sanitize_url(orig)
-                # Optionally inline remote images to make the PDF self-contained
-                if inline_remote:
-                    inlined = fetch_image_as_data_url(sanitized)
-                    if inlined:
-                        stats["inlined"] += 1
-                        return re.sub(r'src\s*=\s*(["\'])([\s\S]*?)\1', f'src="{inlined}"', tag, flags=re.IGNORECASE | re.DOTALL)
-                # Otherwise, keep external but sanitized URL
-                if sanitized and sanitized != orig:
-                    stats["sanitized"] += 1
-                    return re.sub(r'src\s*=\s*(["\'])([\s\S]*?)\1', f'src="{sanitized}"', tag, flags=re.IGNORECASE | re.DOTALL)
-                return tag
-
-            # Keep data URLs or any other unresolved src as-is
-            return tag
-
-        # Replace <img> tags while preserving others
-        html_new = re.sub(r'<img\b[^>]*>', replace_img_tag, html_content, flags=re.IGNORECASE)
-
-        # Handle Outlook VML image references (e.g., <v:imagedata src="cid:..."/>)
-        def replace_vml_tag(m):
-            tag = m.group(0)
-            # Replace src
-            msrc = re.search(r'src\s*=\s*(["\'])([\s\S]*?)\1', tag, flags=re.IGNORECASE | re.DOTALL)
-            if msrc:
-                orig = (msrc.group(2) or '').strip()
-                for lookup in (orig, sanitize_url(orig)):
-                    for c in candidates_for(lookup):
-                        if c in norm_images:
-                            data_url = norm_images[c]
-                            used_data_urls.add(data_url)
-                            tag = re.sub(r'src\s*=\s*(["\'])([\s\S]*?)\1', f'src="{data_url}"', tag, flags=re.IGNORECASE | re.DOTALL)
-                            break
-            # Replace o:href fallback if present
-            mhref = re.search(r'o:href\s*=\s*(["\'])([\s\S]*?)\1', tag, flags=re.IGNORECASE | re.DOTALL)
-            if mhref:
-                orig = (mhref.group(2) or '').strip()
-                for lookup in (orig, sanitize_url(orig)):
-                    for c in candidates_for(lookup):
-                        if c in norm_images:
-                            data_url = norm_images[c]
-                            used_data_urls.add(data_url)
-                            tag = re.sub(r'o:href\s*=\s*(["\'])([\s\S]*?)\1', f'o:href="{data_url}"', tag, flags=re.IGNORECASE | re.DOTALL)
-                            break
-            return tag
-
-        html_new = re.sub(r'<v:imagedata\b[^>]*>', replace_vml_tag, html_new, flags=re.IGNORECASE)
-
-        # Rewrite CSS url(...) references in inline styles (e.g., background-image:url('cid:...'))
-        def css_url_replacer(m):
-            orig = (m.group(2) or '').strip().strip('\'"')
-            if not orig:
-                return m.group(0)
-            low = orig.lower()
-            # Keep existing data URLs
-            if low.startswith('data:'):
-                return m.group(0)
-            # Try to map to embedded images
-            for lookup in (orig, sanitize_url(orig)):
-                for c in candidates_for(lookup):
-                    if c in norm_images:
-                        data_url = norm_images[c]
-                        used_data_urls.add(data_url)
-                        return f'url("{data_url}")'
-            # Sanitize external URLs
-            if low.startswith('http://') or low.startswith('https://'):
-                sanitized = sanitize_url(orig)
-                if sanitized and sanitized != orig:
-                    return f'url("{sanitized}")'
-            return m.group(0)
-
-        html_new = re.sub(r'url\(\s*(["\']?)([\s\S]*?)\1\s*\)', css_url_replacer, html_new, flags=re.IGNORECASE)
-
-        # Remove stray filename-only artifacts
-        fname_pat = r'(?:[A-Za-z0-9_\-]{6,}|[A-F0-9\-]{12,})\.(?:jpg|jpeg|png|gif|bmp|webp)'
-        html_new = re.sub(rf'<(p|div|span)[^>]*>\s*{fname_pat}\s*</\1>', '', html_new, flags=re.IGNORECASE)
-        html_new = re.sub(rf'<li[^>]*>\s*{fname_pat}\s*</li>', '', html_new, flags=re.IGNORECASE)
-        html_new = re.sub(rf'<a[^>]*>\s*{fname_pat}\s*</a>\s*(?:<br\s*/?>)?', '', html_new, flags=re.IGNORECASE)
-        html_new = re.sub(rf'(^|[>\n\r])\s*{fname_pat}\s*(?:<br\s*/?>)?\s*(?=[<\n\r]|$)', r'\1', html_new, flags=re.IGNORECASE)
-
-        # Append truly unreferenced embedded images once
-        unique_data_urls = []
-        seen = set()
-        for v in images.values():
-            if v not in seen:
-                seen.add(v)
-                unique_data_urls.append(v)
-
-        to_append = [u for u in unique_data_urls if u not in used_data_urls and u not in html_new]
-        if to_append:
-            imgs = ''.join([f'<img src="{u}" alt="attachment" class="inline-image" />' for u in to_append])
-            appended_block = '<div class="image-attachments unreferenced-inline-images">' + imgs + '</div>'
-            html_new = _append_html_after_body_content(html_new, appended_block)
-
-        return html_new
-    except Exception as e:
-        logger.warning(f"Error replacing image references: {str(e)}")
-        return html_content
-
-def extract_body_and_images_from_email(msg, msg_attachments=None):
-    """Extract best HTML/plain body and inline images as data URLs."""
-    images = {}
-    attachments = []
-    html_candidates = []
-    text_candidates = []
-    collected_styles: list[str] = []
-    extract_body_and_images_from_email.last_collected_styles = collected_styles
-
-    def process_part(part):
-        try:
-            ctype = part.get_content_type()
-            cdisp = (part.get('Content-Disposition') or '').lower()
-            cid = part.get('Content-ID')
-            if cid:
-                cid = cid.strip('<>')
-            cloc = part.get('Content-Location')
-            fname = part.get_filename()
-
-            is_attachment = 'attachment' in cdisp
-
-            if ctype == 'message/rfc822' or (fname and fname.lower().endswith(('.eml', '.msg'))):
-                payload = part.get_payload(decode=True) or part.get_payload()
-                if 'attachment' in cdisp or fname:
-                    try:
-                        data = payload
-                        if not isinstance(data, (bytes, bytearray)) and hasattr(data, 'as_bytes'):
-                            data = data.as_bytes()
-                        if data and fname and fname.lower().endswith('.msg'):
-                            data = converter.convert_msg_bytes_to_eml_bytes(data)
-                        if data:
-                            pdf_data = eml_bytes_to_pdf_bytes(data)
-                            if pdf_data:
-                                att_name = os.path.splitext(fname or f"attachment-{len(attachments)+1}")[0] + '.pdf'
-                                attachments.append({'filename': att_name, 'content_type': 'application/pdf', 'data': pdf_data})
-                    except Exception as e:
-                        logger.warning(f"Failed to process attached message: {e}")
-                    return
-                try:
-                    if isinstance(payload, (bytes, bytearray)):
-                        nested = email.message_from_bytes(payload, policy=email.policy.default)
-                        process_message(nested)
-                    elif hasattr(payload, 'walk'):
-                        process_message(payload)
-                except Exception as e:
-                    logger.warning(f"Failed to process nested message/rfc822: {e}")
-                return
-
-            # Treat as image if content-type is image/* or filename/content-location indicate an image
-            is_image = False
-            ctype_for_data = ctype
-            try:
-                if ctype and ctype.startswith('image/'):
-                    is_image = True
-                else:
-                    import mimetypes
-                    guess_src = fname or cloc or ''
-                    guessed, _ = mimetypes.guess_type(guess_src)
-                    if guessed and guessed.startswith('image/'):
-                        is_image = True
-                        ctype_for_data = guessed
-            except Exception:
-                pass
-            if is_image:
-                img_bytes = part.get_payload(decode=True)
-                if not img_bytes:
-                    payload = part.get_payload()
-                    if isinstance(payload, (bytes, bytearray)):
-                        img_bytes = payload
-                if img_bytes:
-                    if is_attachment:
-                        att_name = fname or f"attachment-{len(attachments)+1}"
-                        display_bytes, usable_type = _ensure_displayable_image_bytes(
-                            img_bytes,
-                            ctype_for_data or ctype,
-                            source_name=fname or cloc or cid,
-                        )
-                        attachments.append({
-                            'filename': att_name,
-                            'content_type': usable_type or ctype or 'image/octet-stream',
-                            'data': bytes(display_bytes or img_bytes),
-                        })
-                        logger.info(
-                            "Captured image attachment %s (%s, %d bytes) for later PDF conversion",
-                            att_name,
-                            usable_type or ctype or 'image',
-                            len(display_bytes or img_bytes),
-                        )
-                    else:
-                        display_bytes, ctype_for_data = _ensure_displayable_image_bytes(
-                            img_bytes,
-                            ctype_for_data or ctype,
-                            source_name=fname or cloc or cid,
-                        )
-                        if not ctype_for_data:
-                            ctype_for_data = 'image/png'
-                        b64 = base64.b64encode(display_bytes or img_bytes).decode('utf-8')
-                        data_url = f"data:{ctype_for_data};base64,{b64}"
-                        keys = set()
-                        if cid:
-                            keys.add(f"cid:{cid}")
-                            keys.add(cid)
-                        if cloc:
-                            keys.add(cloc)
-                        if fname:
-                            keys.add(fname)
-                            # Also add cid: filename variants so "cid:image001.jpg@..." can resolve via "cid:image001.jpg"
-                            try:
-                                keys.add(f"cid:{fname}")
-                            except Exception:
-                                pass
-                            try:
-                                base = os.path.basename(fname)
-                                if base:
-                                    keys.add(base)
-                                    keys.add(_normalize_key(base))
-                                    try:
-                                        keys.add(f"cid:{base}")
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                        for k in keys:
-                            try:
-                                images[k] = data_url
-                                # Add normalized variants for reliable matching
-                                nk = _normalize_key(str(k))
-                                images[nk] = data_url
-                                if str(k).lower().startswith(('http://', 'https://')):
-                                    images[_normalize_url(str(k))] = data_url
-                            except Exception:
-                                images[k] = data_url
-                        images.setdefault(f"__unref__:{len(images)}", data_url)
-                return
-
-            # PDF or other attachments
-            is_inline_pdf = (ctype == 'application/pdf') or (fname and fname.lower().endswith('.pdf'))
-            is_office = ctype in (
-                'application/msword',
-                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            ) or (fname and fname.lower().endswith(('.doc', '.docx')))
-            if is_attachment or is_inline_pdf or is_office:
-                try:
-                    data = part.get_payload(decode=True)
-                    if not data:
-                        data = part.get_payload()
-                    if data:
-                        if ctype == 'application/pdf' or (fname and fname.lower().endswith('.pdf')):
-                            att_name = fname or f"attachment-{len(attachments)+1}.pdf"
-                            if not att_name.lower().endswith('.pdf'):
-                                att_name += '.pdf'
-                            attachments.append({
-                                'filename': att_name,
-                                'content_type': 'application/pdf',
-                                'data': data,
-                            })
-                            return
-                        if is_office:
-                            ext = os.path.splitext(fname or '')[1] or '.docx'
-                            pdf_data = convert_office_to_pdf(data, ext)
-                            if pdf_data:
-                                att_name = os.path.splitext(fname or f"attachment-{len(attachments)+1}")[0] + '.pdf'
-                                attachments.append({
-                                    'filename': att_name,
-                                    'content_type': 'application/pdf',
-                                    'data': pdf_data,
-                                })
-                            return
-                except Exception as e:
-                    logger.warning(f"Error extracting attachment: {e}")
-                    return
-
-            # Skip non-text attachments
-            if 'attachment' in cdisp and not ctype.startswith('text/'):
-                return
-
-            if ctype == 'text/html':
-                content = get_part_content(part)
-                if content:
-                    logger.info(f"DEBUGGING: Found HTML part with {len(content)} chars")
-                    logger.info(f"DEBUGGING: HTML part preview: {content[:300]}...")
-                    cleaned = clean_html_content(content, style_collector=collected_styles)
-                    html_candidates.append((len(cleaned), cleaned))
-                return
-
-            if ctype == 'text/plain':
-                content = get_part_content(part)
-                if content:
-                    logger.info(f"DEBUGGING: Found text/plain part with {len(content)} chars")
-                    logger.info(f"DEBUGGING: Text part preview: {content[:300]}...")
-                    htmlized = html.escape(content).replace('\n', '<br>\n')
-                    text_candidates.append((len(htmlized), htmlized))
-                return
-        except Exception as e:
-            logger.warning(f"Error processing part: {e}")
-
-    def process_message(message):
-        try:
-            if message.is_multipart():
-                for p in message.walk():
-                    if p is not message:
-                        process_part(p)
-            else:
-                process_part(message)
-        except Exception as e:
-            logger.warning(f"Error walking message: {e}")
-
-    process_message(msg)
-
-    body = None
-    # Prefer HTML when available to preserve formatting (bold, italics, etc.)
-    html_body: str | None = None
-    html_length = 0
-    if html_candidates:
-        html_length, html_body = max(html_candidates, key=lambda t: t[0])
-
-    text_body: str | None = None
-    text_length = 0
-    logger.info(f"DEBUGGING: Body selection - HTML candidates: {len(html_candidates)}, Text candidates: {len(text_candidates)}")
-
-    # CRITICAL FIX: Analyze text parts to avoid duplication with embedded attachments
-    if len(text_candidates) > 1:
-        logger.info(f"DEBUGGING: Multiple text parts detected - analyzing for forwarded content")
-        
-        # Check if there are embedded message attachments that might duplicate forwarded content
-        local_embedded = any(a.get('content_type') == 'message/rfc822' for a in attachments)
-        
-        # Check msg_attachments parameter more thoroughly
-        msg_embedded = False
-        if msg_attachments:
-            msg_embedded = any(
-                a.get('content_type') == 'message/rfc822' or
-                str(a.get('filename', '')).lower().endswith('.eml')
-                for a in msg_attachments
-            )
-            logger.info(f"DEBUGGING: msg_attachments contains {len(msg_attachments)} items:")
-            for i, att in enumerate(msg_attachments):
-                logger.info(f"  - {i+1}: {att.get('filename')} (type: {att.get('content_type')})")
-        
-        has_embedded_msg = local_embedded or msg_embedded
-        logger.info(f"DEBUGGING: Has embedded message attachments: {has_embedded_msg} (local: {local_embedded}, msg_attachments: {msg_embedded})")
-        
-        # Analyze each text part for forwarded vs original content
-        original_parts = []
-        forwarded_parts = []
-        
-        for i, (length, content) in enumerate(text_candidates):
-            preview = content[:200].replace('<br>', ' ').replace('\n', ' ')
-            logger.info(f"DEBUGGING: Analyzing text part {i+1} ({length} chars): {preview}...")
-            
-            # Check if this part contains forwarded message markers
-            is_forwarded = (
-                '---------- Forwarded message ---------' in content and
-                not any(phrase in content[:500] for phrase in ["Good afternoon", "good afternoon", "I wanted to"])
-            )
-            
-            if is_forwarded:
-                logger.info(f"DEBUGGING: Text part {i+1} identified as FORWARDED content (will appear as attachment)")
-                forwarded_parts.append((length, content))
-            else:
-                logger.info(f"DEBUGGING: Text part {i+1} identified as ORIGINAL content")
-                original_parts.append((length, content))
-        
-        # If we have embedded attachments, only use original parts to avoid duplication
-        if has_embedded_msg and original_parts:
-            logger.info(f"DEBUGGING: Using only original parts ({len(original_parts)}) - forwarded content will appear as attachment")
-            combined_parts = [content for length, content in original_parts]
-            text_body = '<br><br>'.join(combined_parts)
-            text_length = len(text_body)
-            logger.info(f"DEBUGGING: Original-only body content: {text_length} chars total")
-        else:
-            # No embedded attachments or no original parts found - combine all
-            logger.info(f"DEBUGGING: No embedded attachments or no original parts - combining all text parts")
-            sorted_text = sorted(text_candidates, key=lambda t: (
-                0 if any(phrase in t[1][:300] for phrase in ["Good afternoon", "good afternoon", "I wanted to"]) else 1,
-                -t[0]
-            ))
-            combined_parts = [content for length, content in sorted_text]
-            text_body = '<br><br>'.join(combined_parts)
-            text_length = len(text_body)
-            logger.info(f"DEBUGGING: All-parts combined content: {text_length} chars total")
-        
-    elif text_candidates:
-        text_length, text_body = max(text_candidates, key=lambda t: t[0])
-        logger.info(f"DEBUGGING: Selected single text body with {text_length} chars")
-
-    # Final decision: if an HTML body exists, prefer it to preserve formatting
-    if html_body:
-        if text_body and html_body != text_body:
-            logger.info(
-                "DEBUGGING: Preferring HTML body with %s chars over text body with %s chars to preserve formatting",
-                html_length,
-                text_length,
-            )
-        else:
-            logger.info(
-                "DEBUGGING: Using HTML body (%s chars); text was %s",
-                html_length,
-                text_length if text_body else 'absent',
-            )
-        body = html_body
-    elif text_body is not None:
-        body = text_body
-
-    if not body:
-        body = "No content available"
-    
-    # CRITICAL FIX: Check if body contains forwarded message but missing original content
-    if body and "---------- Forwarded message ---------" in body:
-        logger.info(f"DEBUGGING: Detected forwarded message in body")
-        
-        # Look for patterns that suggest the original content before forwarded message is missing
-        if not any(phrase in body[:500] for phrase in ["Good afternoon", "good afternoon", "Good morning", "good morning", "Hello", "hello", "Hi ", "hi "]):
-            logger.warning(f"DEBUGGING: Original content may be missing - body starts with forwarded content")
-            
-            # Try to find the complete content by examining all parts more thoroughly
-            logger.info(f"DEBUGGING: Searching for complete content in all EML parts")
-            complete_content_found = False
-            
-            for part in msg.walk():
-                if part.get_content_type() in ['text/plain', 'text/html']:
-                    full_content = get_part_content(part)
-                    if full_content and len(full_content) > len(body):
-                        # Check if this part contains both original greeting AND forwarded content
-                        has_greeting = any(phrase in full_content for phrase in ["Good afternoon", "good afternoon", "I wanted to", "afternoon, Nick"])
-                        has_forwarded = "---------- Forwarded message ---------" in full_content
-                        
-                        if has_greeting or len(full_content) > len(body) * 2:  # Much larger content
-                            logger.info(f"DEBUGGING: Found better content part: {len(full_content)} chars (has_greeting: {has_greeting}, has_forwarded: {has_forwarded})")
-                            logger.info(f"DEBUGGING: Better content preview: {full_content[:300]}...")
-                            
-                            if part.get_content_type() == 'text/plain':
-                                body = html.escape(full_content).replace('\n', '<br>\n')
-                            else:
-                                body = clean_html_content(full_content, style_collector=collected_styles)
-                            complete_content_found = True
-                            break
-            
-            if not complete_content_found:
-                logger.warning(f"DEBUGGING: Could not find complete content - using existing body")
-
-    if images and body:
-        body = replace_image_references(body, {k: v for k, v in images.items() if not str(k).startswith('__unref__:')})
-
-    if body:
-        body, inline_styles = _extract_style_blocks(body)
-        if inline_styles:
-            collected_styles.extend(inline_styles)
-            logger.info(f"Captured {len(inline_styles)} <style> block(s) during body extraction")
-
-    # Normalize whitespace in the final body
-    body = normalize_whitespace(body)
-
-    logger.info(f"Parsed email: body_len={len(body) if body else 0}, images_inlined={sum(1 for k in images.keys() if not str(k).startswith('__unref__:'))}")
-    return body, images, attachments
-
-def _safe_decode_header(value) -> str:
-    """Decode RFC 2047/2231 encoded header values to a readable string."""
-    try:
-        if value is None:
-            return "Unknown"
-        # Coerce header objects to string first
-        if not isinstance(value, (str, bytes)):
-            value = str(value)
-        parts = decode_header(value)
-        out = []
-        for chunk, enc in parts:
-            if isinstance(chunk, bytes):
-                try:
-                    out.append(chunk.decode(enc or 'utf-8', errors='replace'))
-                except Exception:
-                    out.append(chunk.decode('utf-8', errors='replace'))
-            else:
-                out.append(chunk)
-        return ''.join(out).strip()
-    except Exception:
-        try:
-            return str(value)
-        except Exception:
-            return "Unknown"
-
-
-def _format_address_header(value: str | None) -> str:
-    """Normalize an address header to ``"Name <addr>"`` tokens when possible."""
-    if value is None:
-        return "Unknown"
-
-    if not isinstance(value, str):
-        value = str(value)
-
-    value = value.strip()
-    if not value:
-        return value
-
-    formatted_parts: list[str] = []
-
-    try:
-        address_candidates = getaddresses([value])
-    except Exception:
-        address_candidates = []
-
-    for display, addr in address_candidates:
-        candidate = ""
-        if display or addr:
-            try:
-                candidate = formataddr((display, addr))
-            except Exception:
-                candidate = addr or display
-
-        if not candidate:
-            continue
-
-        parsed_display, parsed_addr = parseaddr(candidate)
-        parsed_display = parsed_display.strip()
-        parsed_addr = parsed_addr.strip()
-
-        if parsed_addr:
-            if parsed_display:
-                formatted_parts.append(f"{parsed_display} <{parsed_addr}>")
-            else:
-                formatted_parts.append(parsed_addr)
-        elif parsed_display:
-            formatted_parts.append(parsed_display)
-
-    if formatted_parts:
-        return ', '.join(formatted_parts)
-
-    parsed_display, parsed_addr = parseaddr(value)
-    parsed_display = parsed_display.strip()
-    parsed_addr = parsed_addr.strip()
-
-    if parsed_addr:
-        if parsed_display:
-            return f"{parsed_display} <{parsed_addr}>"
-        return parsed_addr
-
-    return value
-
-
-def _parse_address_pairs(value: str | None) -> list[tuple[str, str]]:
-    """Return parsed ``(display, address)`` tuples for an address header."""
-    if value is None:
-        return []
-
-    if not isinstance(value, str):
-        value = str(value)
-
-    candidate = value.strip()
-    if not candidate:
-        return []
-
-    pairs: list[tuple[str, str]] = []
-    try:
-        raw_addresses = getaddresses([candidate])
-    except Exception:
-        raw_addresses = []
-
-    for display, addr in raw_addresses:
-        display = (display or '').strip()
-        addr = (addr or '').strip()
-        if display or addr:
-            pairs.append((display, addr))
-
-    if pairs:
-        return pairs
-
-    fallback_display, fallback_addr = parseaddr(candidate)
-    fallback_display = (fallback_display or '').strip()
-    fallback_addr = (fallback_addr or '').strip()
-
-    if fallback_display or fallback_addr:
-        return [(fallback_display, fallback_addr)]
-
-    return []
-
-
-def _format_address_header_compact(value: str | None) -> str:
-    """Return a compact string like ``"Name addr"`` without angle brackets."""
-    pairs = _parse_address_pairs(value)
-    if pairs:
-        formatted: list[str] = []
-        for display, addr in pairs:
-            if display and addr:
-                formatted.append(f"{display} {addr}")
-            elif addr:
-                formatted.append(addr)
-            elif display:
-                formatted.append(display)
-
-        if formatted:
-            return ', '.join(formatted)
-
-    if value is None:
-        return "Unknown"
-
-    return str(value).strip()
-
-
-def _build_sender_value_html(value: str | None) -> str:
-    """Create HTML markup that bolds the sender name and keeps email lightweight."""
-    pairs = _parse_address_pairs(value)
-
-    if not pairs:
-        fallback = (value or 'Unknown Sender').strip() or 'Unknown Sender'
-        return f"<span class=\"from-name\">{html.escape(fallback)}</span>"
-
-    if len(pairs) > 1:
-        compact = _format_address_header_compact(value)
-        safe = html.escape(compact if compact else (value or 'Unknown Sender'))
-        return f"<span class=\"from-name\">{safe}</span>"
-
-    display, addr = pairs[0]
-    primary = display or addr or (value or '').strip() or 'Unknown Sender'
-
-    segments: list[str] = []
-    segments.append(f"<span class=\"from-name\">{html.escape(primary)}</span>")
-
-    if addr and addr != primary:
-        segments.append(f"<span class=\"from-email\">{html.escape(addr)}</span>")
-
-    return ' '.join(segments)
-
-
-def _extract_display_date(msg) -> str:
-    """Return a human-readable date for the message with sensible fallbacks.
-    Prefers the Date header as-is; falls back to common alternative headers or the trailing
-    timestamp from the first Received header. Never returns an empty string.
-    """
-    # Prefer standard Date header
-    primary = msg.get('Date')
-    dstr = _safe_decode_header(primary) if primary else ''
-    if dstr:
-        return dstr
-
-    # Common alternates seen in various clients/gateways
-    alt_headers = [
-        'Sent', 'X-Original-Date', 'Original-Date', 'Resent-Date', 'Delivery-date',
-        'X-Received-Date', 'X-Delivery-Date', 'X-Apple-Original-Arrival-Date',
-    ]
-    for h in alt_headers:
-        v = msg.get(h)
-        dstr = _safe_decode_header(v) if v else ''
-        if dstr:
-            return dstr
-
-    # Parse from the topmost Received header (date appears after the last semicolon)
-    try:
-        recvd = msg.get_all('Received') or []
-        if recvd:
-            first = _safe_decode_header(recvd[0]) or ''
-            if ';' in first:
-                tail = first.rsplit(';', 1)[-1].strip()
-                if tail:
-                    return tail
-    except Exception:
-        pass
-
-    return 'Unknown Date'
-
-
 def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: str = None, msg_attachments: list = None) -> bool:
     """Convert EML content to PDF using Playwright with fallback to FPDF."""
     import html  # Import html module to avoid variable conflict
@@ -1611,29 +140,32 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         msg = email.message_from_bytes(eml_content, policy=default)
         logger.info("EML message parsed successfully")
 
-        # Extract basic email information (decode safely)
-        subject = _safe_decode_header(msg.get('Subject', 'No Subject'))
-        sender_decoded = _safe_decode_header(msg.get('From', 'Unknown Sender'))
-        recipient_decoded = _safe_decode_header(msg.get('To', 'Unknown Recipient'))
-        cc_decoded = _safe_decode_header(msg.get('Cc', ''))
-        sender = _format_address_header(sender_decoded)
-        recipient = _format_address_header(recipient_decoded)
-        recipient_compact = _format_address_header_compact(recipient_decoded)
-        recipient_display = recipient_compact or recipient
-        sender_value_html = _build_sender_value_html(sender_decoded)
-        date_display = _extract_display_date(msg)
-        
-        # Process CC field if present
-        cc_display = ""
-        cc_html = ""
-        if cc_decoded and cc_decoded.strip():
-            cc_formatted = _format_address_header(cc_decoded)
-            cc_compact = _format_address_header_compact(cc_decoded)
-            cc_display = cc_compact or cc_formatted
-            cc_html = f'<div class="header-item"><span class="label">Cc:</span><span class="value">{html.escape(cc_display)}</span></div>'
-            logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Cc='{cc_display}', Date='{date_display}'")
+        header_context = collect_header_context(msg)
+        subject = header_context.subject
+        sender = header_context.sender_formatted
+        recipient = header_context.recipient_formatted
+        recipient_display = header_context.recipient_display
+        sender_value_html = header_context.sender_value_html
+        date_display = header_context.date_display
+        cc_html = header_context.cc_html
+
+        if header_context.cc_display:
+            logger.info(
+                "Email metadata: Subject='%s', From='%s', To='%s', Cc='%s', Date='%s'",
+                subject,
+                sender,
+                recipient,
+                header_context.cc_display,
+                date_display,
+            )
         else:
-            logger.info(f"Email metadata: Subject='{subject}', From='{sender}', To='{recipient}', Date='{date_display}' (No CC)")
+            logger.info(
+                "Email metadata: Subject='%s', From='%s', To='%s', Date='%s' (No CC)",
+                subject,
+                sender,
+                recipient,
+                date_display,
+            )
 
         # Debug: Check if the EML has multipart structure
         logger.info(f"DEBUGGING: EML is_multipart: {msg.is_multipart()}")
@@ -1650,7 +182,13 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         # Rich extraction: body + inline images
         logger.info("Extracting email body + inline images...")
         try:
-            body, images, attachments = extract_body_and_images_from_email(msg, msg_attachments)
+            body, images, attachments = extract_body_and_images_from_email(
+                msg,
+                msg_attachments,
+                msg_to_eml_converter=converter.convert_msg_bytes_to_eml_bytes,
+                eml_to_pdf_converter=doc_converter.eml_bytes_to_pdf_bytes,
+                office_to_pdf_converter=doc_converter.convert_office_to_pdf,
+            )
             logger.info(f"DEBUGGING: Rich extraction completed - body_len={len(body)}, images={len(images)}, attachments={len(attachments)}")
         except Exception as e:
             logger.error(f"Rich extraction failed: {e}")
@@ -1682,7 +220,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 logger.info(f"DEBUGGING: Fallback single part body: {len(body)} chars")
             if body:
                 fallback_styles = []
-                body, fallback_styles = _extract_style_blocks(body)
+                body, fallback_styles = extract_style_blocks(body)
                 if fallback_styles:
                     try:
                         style_holder = getattr(extract_body_and_images_from_email, "last_collected_styles")
@@ -1704,7 +242,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             logger.warning(f"DEBUGGING: Body content is EMPTY!")
         # Capture <style> blocks before removing wrapping HTML so we can reattach them later
         if body:
-            body, inline_styles = _extract_style_blocks(body)
+            body, inline_styles = extract_style_blocks(body)
             if inline_styles:
                 try:
                     style_holder = getattr(extract_body_and_images_from_email, "last_collected_styles")
@@ -1730,8 +268,8 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
             logger.warning(f"Failed to strip outer HTML tags: {e}")
 
         if body:
-            body = _normalize_body_html_fragment(body)
-            body, word_cleanup = _strip_word_section_wrappers(body)
+            body = normalize_body_html_fragment(body)
+            body, word_cleanup = strip_word_section_wrappers(body)
             if word_cleanup.get('wrappers_removed') or word_cleanup.get('class_refs_removed'):
                 logger.info(
                     "WORD CLEANUP: Removed %s WordSection wrapper(s); stripped %s WordSection class reference(s)",
@@ -1742,7 +280,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
         attachments = list(attachments or [])
         msg_attachments = list(msg_attachments or [])
 
-        body, attachments, inlined_primary = _inline_image_attachments_into_body(
+        body, attachments, inlined_primary = inline_image_attachments_into_body(
             body,
             attachments,
             'email-attachment',
@@ -1753,7 +291,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 att for att in msg_attachments
                 if (att.get('filename') or '').lower() not in primary_names
             ]
-        body, msg_attachments, inlined_msg = _inline_image_attachments_into_body(
+        body, msg_attachments, inlined_msg = inline_image_attachments_into_body(
             body,
             msg_attachments,
             'msg-attachment',
@@ -1765,7 +303,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 len(inlined_msg),
             )
 
-        body = _normalize_body_html_fragment(body)
+        body = normalize_body_html_fragment(body)
 
         try:
             _pdf_att_meta = [
@@ -1801,7 +339,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 seen_styles.add(normalized_block)
                 try:
                     inner = re.sub(r'^<style[^>]*>|</style>$', '', normalized_block, flags=re.IGNORECASE).strip()
-                    inner_sanitized, reps = _sanitize_style_block_css(inner)
+                    inner_sanitized, reps = sanitize_style_block_css(inner)
                     total_replacements_css += reps
                     unique_styles.append(f"<style>\n{inner_sanitized}\n</style>")
                 except Exception:
@@ -2098,7 +636,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                 for idx, att in enumerate(source_list, start=1):
                     fname = att.get('filename') or f'attachment-{idx}'
                     ctype = att.get('content_type') or ''
-                    if not _looks_like_image(ctype, fname):
+                    if not looks_like_image(ctype, fname):
                         continue
                     raw = att.get('data') or b''
                     if not isinstance(raw, (bytes, bytearray)):
@@ -2119,7 +657,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                         )
                         continue
 
-                    pdf_bytes, page_count = _convert_image_bytes_to_pdf(raw, fname)
+                    pdf_bytes, page_count = convert_image_bytes_to_pdf(raw, fname)
                     if not pdf_bytes:
                         logger.warning(
                             "%s image attachment %s could not be converted to PDF",
@@ -2181,7 +719,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                                 logger.warning(f"Failed to convert embedded EML to PDF: {att_filename}")
                         except Exception as eml_e:
                             logger.warning(f"Error converting embedded EML {att_filename} to PDF: {eml_e}")
-                    elif _looks_like_image(att_content_type, att_filename):
+                    elif looks_like_image(att_content_type, att_filename):
                         img_data = att.get('data') or b''
                         if not isinstance(img_data, (bytes, bytearray)):
                             try:
@@ -2195,7 +733,7 @@ def convert_eml_to_pdf(eml_content: bytes, output_path: str, twemoji_base_url: s
                         if not img_data:
                             logger.warning(f"Skipping empty image attachment {att_filename}")
                             continue
-                        pdf_bytes, page_count = _convert_image_bytes_to_pdf(img_data, att_filename)
+                        pdf_bytes, page_count = convert_image_bytes_to_pdf(img_data, att_filename)
                         if not pdf_bytes:
                             logger.warning(f"Failed to convert image attachment {att_filename} to PDF")
                             continue
@@ -2537,7 +1075,7 @@ def html_to_pdf_playwright(html_content: str, output_path: str, twemoji_base_url
                 # Generate PDF with comprehensive options
                 pdf_start = time.time()
                 logger.info(f"Starting PDF generation to: {output_path}")
-                page_format, page_margins = _resolve_pdf_layout_settings()
+                page_format, page_margins = resolve_pdf_layout_settings()
                 # Use minimal margins for better content flow
                 pdf_margins = page_margins.copy()
                 pdf_margins['top'] = '0.3in'  # Further reduced
