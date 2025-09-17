@@ -3,7 +3,8 @@ FROM public.ecr.aws/lambda/python:3.11
 
 # ---------- System packages ----------
 # perl, build tools (for CPAN if needed), fonts/libs for wkhtmltopdf, wget, tar, xz
-RUN yum install -y \
+RUN mkdir -p /tmp/yum-cache \
+ && yum --setopt=tsflags=nodocs --setopt=cachedir=/tmp/yum-cache install -y \
     perl \
     perl-CPAN \
     make \
@@ -24,7 +25,8 @@ RUN yum install -y \
     wget \
     tar \
     xz \
- && yum clean all
+ && yum clean all \
+ && rm -rf /tmp/yum-cache
 
 # ---------- Install Email::Outlook::Message (provides msgconvert) ----------
 # (cpan is interactive by default; force non-interactive)
