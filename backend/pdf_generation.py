@@ -19,6 +19,7 @@ import tempfile
 import textwrap
 import time
 import traceback
+from bs4 import BeautifulSoup
 from html.parser import HTMLParser
 from typing import Optional
 
@@ -727,6 +728,101 @@ class PDFGenerationService:
             </html>
             """
 
+            is_forward = bool(re.search(r"^\s*(fw|fwd)\s*:", subject or "", re.I))
+            try:
+                self.logger.info(
+                    "[PDF] meta: subject=%r is_forward=%s from=%r to=%r date=%r cc_present=%s",
+                    subject,
+                    is_forward,
+                    sender,
+                    recipient,
+                    date_display,
+                    bool(cc_html),
+                )
+            except Exception:
+                self.logger.info(
+                    "[PDF] meta: subject=%r is_forward=%s", subject, is_forward
+                )
+
+            try:
+                soup_dbg = BeautifulSoup(body or "", "lxml")
+                imgs = soup_dbg.find_all("img")
+                tables = soup_dbg.find_all("table")
+                text_chars = len((soup_dbg.text or ""))
+                self.logger.info(
+                    "[PDF] body structure: imgs=%d tables=%d chars=%d",
+                    len(imgs),
+                    len(tables),
+                    text_chars,
+                )
+                preview = (soup_dbg.text or "")[:400].replace("\n", " ").strip()
+                if preview:
+                    self.logger.debug("[PDF] body preview: %s", preview)
+            except Exception as body_dbg_err:
+                self.logger.warning(
+                    "[PDF] body inspection failed: %s", body_dbg_err
+                )
+
+            try:
+                soup_full = BeautifulSoup(html_content, "lxml")
+                header_items = soup_full.select(".email-header .header-item")
+                header_summary = [
+                    item.get_text(" ", strip=True) for item in header_items
+                ]
+                cc_entries = [
+                    text for text in header_summary if text.lower().startswith("cc:")
+                ]
+                self.logger.info(
+                    "[PDF] header structure: items=%d cc_entries=%s",
+                    len(header_items),
+                    cc_entries[:2],
+                )
+
+                img_tags = soup_full.find_all("img")
+                total_imgs = len(img_tags)
+                missing_cids: list[str] = []
+                non_file_imgs: list[str] = []
+                file_imgs = 0
+                data_imgs = 0
+                remote_http = 0
+                for img in img_tags:
+                    src = (img.get("src") or "").strip()
+                    if not src:
+                        continue
+                    if src.startswith("cid:"):
+                        missing_cids.append(src)
+                    elif src.startswith("file://"):
+                        file_imgs += 1
+                    elif src.startswith("data:"):
+                        data_imgs += 1
+                    elif src.startswith(("http://", "https://")):
+                        remote_http += 1
+                    else:
+                        non_file_imgs.append(src)
+
+                mapped_to_file = file_imgs + data_imgs
+                other_src = len(non_file_imgs)
+                self.logger.info(
+                    "[PDF][CID] images: total=%d mapped_to_file=%d missing_cid=%d other_src=%d data_src=%d remote_http=%d",
+                    total_imgs,
+                    mapped_to_file,
+                    len(missing_cids),
+                    other_src,
+                    data_imgs,
+                    remote_http,
+                )
+                if missing_cids:
+                    self.logger.warning(
+                        "[PDF][CID] unresolved cid srcs: %s", missing_cids[:10]
+                    )
+                if non_file_imgs:
+                    self.logger.warning(
+                        "[PDF][IMG] non-file/non-http srcs: %s",
+                        non_file_imgs[:10],
+                    )
+            except Exception as cid_err:
+                self.logger.warning("[PDF][CID] image inspection failed: %s", cid_err)
+
             if shutil.disk_usage("/tmp").free < 25 * 1024 * 1024:
                 logger.error("Insufficient /tmp space for PDF generation")
                 return False
@@ -1259,6 +1355,61 @@ class PDFGenerationService:
                                 f"Twemoji inline SVG injection failed: {tw_error}"
                             )
 
+                    try:
+                        metrics = page.evaluate(
+                            """
+() => {
+  const meta = document.querySelector('.email-header');
+  const body = document.querySelector('.email-body');
+  const first = (body && body.querySelector('.first-chunk')) || (body && body.firstElementChild) || body || document.body;
+  const mk = (el) => (el ? el.getBoundingClientRect() : null);
+
+  const gs = (el) => {
+    if (!el) return null;
+    const s = getComputedStyle(el);
+    return {
+      breakInside: s.breakInside,
+      pageBreakBefore: s.pageBreakBefore,
+      pageBreakAfter: s.pageBreakAfter,
+      orphans: s.orphans,
+      widows: s.widows,
+      marginTop: s.marginTop,
+      marginBottom: s.marginBottom,
+      fontFamily: s.fontFamily,
+      fontSize: s.fontSize
+    };
+  };
+
+  return {
+    viewport: { w: window.innerWidth, h: window.innerHeight },
+    headerRect: mk(meta),
+    firstRect: mk(first),
+    headerStyle: gs(meta),
+    firstStyle: gs(first),
+    imgCount: document.images.length,
+    firstImgs: Array.from(first ? first.querySelectorAll('img') : document.querySelectorAll('img')).slice(0, 5).map((img) => img.src)
+  };
+}
+"""
+                        )
+                        logger.info(
+                            "[PDF][DOM] viewport=%s headerRect=%s firstRect=%s",
+                            metrics.get("viewport"),
+                            metrics.get("headerRect"),
+                            metrics.get("firstRect"),
+                        )
+                        logger.info(
+                            "[PDF][DOM] headerStyle=%s firstStyle=%s imgCount=%s firstImgs=%s",
+                            metrics.get("headerStyle"),
+                            metrics.get("firstStyle"),
+                            metrics.get("imgCount"),
+                            metrics.get("firstImgs"),
+                        )
+                    except Exception as dom_err:
+                        logger.warning(
+                            f"[PDF][DOM] metric probe failed: {dom_err}"
+                        )
+
                     pdf_start = time.time()
                     logger.info(f"Starting PDF generation to: {output_path}")
                     page_format, page_margins = resolve_pdf_layout_settings()
@@ -1318,6 +1469,12 @@ class PDFGenerationService:
                         pdf_size = os.path.getsize(output_path)
                         logger.info(
                             f"PDF file created successfully: {output_path} ({pdf_size} bytes)"
+                        )
+                        logger.info(
+                            "[PDF] generated path=%s bytes=%d time_ms=%d",
+                            output_path,
+                            pdf_size,
+                            int(pdf_generation_time * 1000),
                         )
                     else:
                         logger.error(
