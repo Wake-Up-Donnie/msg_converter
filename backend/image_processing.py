@@ -6,6 +6,8 @@ import os
 import re
 from typing import Dict, List, Tuple
 
+from bs4 import BeautifulSoup
+
 from html_processing import append_html_after_body_content
 
 
@@ -26,6 +28,22 @@ SUPPORTED_INLINE_IMAGE_TYPES = {
 }
 
 
+def convert_tiff_to_png_bytes(image_bytes: bytes) -> tuple[bytes, str]:
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        frames = getattr(im, "n_frames", 1)
+        if frames and frames > 1:
+            logger.info("[PDF][TIFF] multi-frame TIFF detected; using first frame")
+            im.seek(0)
+        if im.mode not in ("RGB", "RGBA"):
+            logger.info("[PDF][TIFF] converting mode %s -> RGBA", im.mode)
+            im = im.convert("RGBA")
+        out = io.BytesIO()
+        im.save(out, format="PNG", optimize=True)
+        return out.getvalue(), "image/png"
+
+
 def looks_like_image(content_type: str | None, filename: str | None) -> bool:
     ctype = (content_type or '').lower()
     if ctype.startswith('image/'):
@@ -43,9 +61,27 @@ def ensure_displayable_image_bytes(
     if not isinstance(img_bytes, (bytes, bytearray)) or not img_bytes:
         return None, content_type
 
+    payload_bytes = bytes(img_bytes)
     normalized_ct = (content_type or '').lower()
+    name_lower = (source_name or '').lower()
+    if normalized_ct in (
+        'image/tiff',
+        'image/tif',
+        'image/x-tiff',
+    ) or name_lower.endswith(('.tif', '.tiff')):
+        logger.warning(
+            "[PDF][TIFF] converting TIFF attachment to PNG for inline rendering"
+        )
+        try:
+            converted_bytes, converted_type = convert_tiff_to_png_bytes(payload_bytes)
+            return converted_bytes, converted_type
+        except Exception as tiff_err:
+            logger.exception(
+                "[PDF][TIFF] conversion failed; leaving as-is: %s", tiff_err
+            )
+
     if normalized_ct in SUPPORTED_INLINE_IMAGE_TYPES:
-        return bytes(img_bytes), normalized_ct or 'image/png'
+        return payload_bytes, normalized_ct or 'image/png'
 
     label = source_name or 'inline image'
     try:
@@ -57,10 +93,10 @@ def ensure_displayable_image_bytes(
             normalized_ct or 'unknown',
             import_err,
         )
-        return bytes(img_bytes), content_type or 'application/octet-stream'
+        return payload_bytes, content_type or 'application/octet-stream'
 
     try:
-        with Image.open(io.BytesIO(img_bytes)) as pil_img:
+        with Image.open(io.BytesIO(payload_bytes)) as pil_img:
             try:
                 if getattr(pil_img, 'n_frames', 1) > 1:
                     pil_img.seek(0)
@@ -89,7 +125,7 @@ def ensure_displayable_image_bytes(
             normalized_ct or 'unknown',
             convert_err,
         )
-    return bytes(img_bytes), content_type or 'application/octet-stream'
+    return payload_bytes, content_type or 'application/octet-stream'
 
 
 def convert_image_bytes_to_pdf(image_bytes: bytes, source_name: str | None = None) -> Tuple[bytes | None, int]:
@@ -428,6 +464,54 @@ def replace_image_references(html_content: str, images: Dict[str, str]) -> str:
             imgs = ''.join([f'<img src="{u}" alt="attachment" class="inline-image" />' for u in to_append])
             appended_block = '<div class="image-attachments unreferenced-inline-images">' + imgs + '</div>'
             html_new = append_html_after_body_content(html_new, appended_block)
+
+        try:
+            soup_dbg = BeautifulSoup(html_new, "lxml")
+            img_tags = soup_dbg.find_all("img")
+            total_imgs = len(img_tags)
+            missing_cids: List[str] = []
+            non_file_imgs: List[str] = []
+            file_imgs = 0
+            data_imgs = 0
+            remote_http = 0
+            for tag in img_tags:
+                src = (tag.get("src") or "").strip()
+                if not src:
+                    continue
+                if src.startswith("cid:"):
+                    missing_cids.append(src)
+                elif src.startswith("file://"):
+                    file_imgs += 1
+                elif src.startswith("data:"):
+                    data_imgs += 1
+                elif src.startswith(("http://", "https://")):
+                    remote_http += 1
+                else:
+                    non_file_imgs.append(src)
+
+            mapped_to_file = file_imgs + data_imgs
+            other_src = len(non_file_imgs)
+            logger.info(
+                "[PDF][CID] images: total=%d mapped_to_file=%d missing_cid=%d other_src=%d data_src=%d remote_http=%d",
+                total_imgs,
+                mapped_to_file,
+                len(missing_cids),
+                other_src,
+                data_imgs,
+                remote_http,
+            )
+            if missing_cids:
+                logger.warning(
+                    "[PDF][CID] unresolved cid srcs: %s", missing_cids[:10]
+                )
+            if non_file_imgs:
+                logger.warning(
+                    "[PDF][IMG] non-file/non-http srcs: %s", non_file_imgs[:10]
+                )
+        except Exception as cid_dbg_err:
+            logger.warning(
+                "[PDF][CID] image mapping inspection failed: %s", cid_dbg_err
+            )
 
         return html_new
     except Exception as e:

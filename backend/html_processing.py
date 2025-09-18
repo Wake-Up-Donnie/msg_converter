@@ -6,6 +6,20 @@ from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
 
+PAGE_BREAK_RE = re.compile(
+    r"page-break-(before|after)\s*:\s*(always|left|right)(?:\s*!important)?\s*;?",
+    re.IGNORECASE,
+)
+
+
+def _strip_page_breaks_from_inline(style_val: str) -> str:
+    if not style_val:
+        return style_val
+    hits = [m.group(0) for m in PAGE_BREAK_RE.finditer(style_val)]
+    if hits:
+        logger.warning("[PDF][CSS] stripping inline page-break: %s", hits)
+    return style_val
+
 
 def _sanitize_css_values(prop: str, value: str) -> str:
     try:
@@ -37,6 +51,10 @@ def _sanitize_css_values(prop: str, value: str) -> str:
 
 def sanitize_style_block_css(css_text: str) -> Tuple[str, int]:
     try:
+        css_text = css_text or ""
+        matches = [m.group(0) for m in PAGE_BREAK_RE.finditer(css_text)]
+        if matches:
+            logger.warning("[PDF][CSS] stripping page-break rules: %s", matches)
         replacements = 0
 
         def repl(m: re.Match) -> str:
@@ -53,7 +71,7 @@ def sanitize_style_block_css(css_text: str) -> Tuple[str, int]:
             r"(?P<separator>\s*:\s*)(?P<value>[^;}{]+)(?P<suffix>;?)",
             flags=re.IGNORECASE,
         )
-        sanitized = pattern.sub(repl, css_text or "")
+        sanitized = pattern.sub(repl, css_text)
 
         page_pattern = re.compile(r'@page\s+[^{}]*\{[^{}]*\}', flags=re.IGNORECASE | re.DOTALL)
         sanitized, page_block_count = page_pattern.subn('', sanitized)
@@ -90,6 +108,8 @@ def clean_html_content(html_content: str, style_collector: List[str] | None = No
         )
 
         def _sanitize_style_content(style_content: str) -> str:
+            stripped = _strip_page_breaks_from_inline(style_content)
+
             def _replace(match: re.Match[str]) -> str:
                 value = match.group('value')
                 prop_name = match.group('prop').lower()
@@ -106,7 +126,7 @@ def clean_html_content(html_content: str, style_collector: List[str] | None = No
                     )
                 return f"{match.group('prop')}{match.group('separator')}{sanitized_value}{match.group('suffix')}"
 
-            return inline_page_break_pattern.sub(_replace, style_content)
+            return inline_page_break_pattern.sub(_replace, stripped)
 
         def _sanitize_style_attribute(match):
             prefix = match.group(1)
