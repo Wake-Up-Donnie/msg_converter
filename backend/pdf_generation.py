@@ -34,6 +34,7 @@ from html_processing import (
     normalize_whitespace,
     sanitize_style_block_css,
     strip_word_section_wrappers,
+    wrap_forwarded_header_blocks,
 )
 from image_processing import (
     convert_image_bytes_to_pdf,
@@ -433,6 +434,16 @@ class PDFGenerationService:
                         word_cleanup.get("wrappers_removed", 0),
                         word_cleanup.get("class_refs_removed", 0),
                     )
+                try:
+                    _b = body.count('forwarded-header-block')
+                except Exception:
+                    _b = 0
+                body = wrap_forwarded_header_blocks(body)
+                try:
+                    _a = body.count('forwarded-header-block')
+                except Exception:
+                    _a = 0
+                logger.info(f"FORWARDED WRAP (pre-clean): before={_b}, after={_a}")
 
             attachments = list(attachments or [])
             msg_attachments = list(msg_attachments or [])
@@ -462,6 +473,16 @@ class PDFGenerationService:
                 )
 
             body = normalize_body_html_fragment(body)
+            try:
+                _b2 = body.count('forwarded-header-block')
+            except Exception:
+                _b2 = 0
+            body = wrap_forwarded_header_blocks(body)
+            try:
+                _a2 = body.count('forwarded-header-block')
+            except Exception:
+                _a2 = 0
+            logger.info(f"FORWARDED WRAP (post-clean): before={_b2}, after={_a2}")
 
             try:
                 _pdf_att_meta = [
@@ -596,6 +617,8 @@ class PDFGenerationService:
                         font-size: 10px;
                         line-height: 1.15;
                         color: #1f1f1f;
+                        page-break-before: avoid !important;
+                        break-before: avoid !important;
                         page-break-after: avoid !important;
                         break-after: avoid !important;
                         page-break-inside: avoid !important;
@@ -604,9 +627,17 @@ class PDFGenerationService:
                     }}
                     .email-header .header-item {{
                         margin: 0;
+                        page-break-before: avoid !important;
+                        break-before: avoid !important;
+                        page-break-inside: avoid !important;
+                        break-inside: avoid !important;
                     }}
                     .email-header .header-item + .header-item {{
                         margin-top: 3px;
+                    }}
+                    .email-header .header-item.cc-item {{
+                        page-break-before: avoid !important;
+                        break-before: avoid !important;
                     }}
                     .email-header .label {{
                         font-weight: 700 !important;
@@ -625,6 +656,24 @@ class PDFGenerationService:
                     }}
                     .email-header .subject-value {{
                         font-weight: 600 !important;
+                    }}
+                    .forwarded-header-block {{
+                        margin: 8px 0 10px;
+                        padding: 0;
+                        display: inline-block; /* Chromium tends to honor non-fragmentation better */
+                        width: 100%;
+                        vertical-align: top;
+                        page-break-before: avoid !important;
+                        break-before: avoid !important;
+                        page-break-after: avoid !important;
+                        break-after: avoid !important;
+                        page-break-inside: avoid !important;
+                        break-inside: avoid !important;
+                    }}
+                    .forwarded-header-block > * {{
+                        page-break-inside: avoid !important;
+                        break-inside: avoid !important;
+                        margin: 0 !important;
                     }}
                     .email-body {{
                         margin: 0 !important;
@@ -715,10 +764,10 @@ class PDFGenerationService:
             </head>
             <body>
                 <div class=\"email-header\">
-                    <div class=\"header-item\"><span class=\"label\">From:</span><span class=\"value from-value\">{sender_value_html}</span></div>
-                    <div class=\"header-item\"><span class=\"label\">To:</span><span class=\"value\">{html.escape(recipient_display or recipient)}</span></div>
-                    <div class=\"header-item\"><span class=\"label\">Subject:</span><span class=\"value subject-value\">{html.escape(subject)}</span></div>
-                    <div class=\"header-item\"><span class=\"label\">Date:</span><span class=\"value\">{html.escape(date_display)}</span></div>
+                    <div class=\"header-item\"><span class=\"label\" style=\"font-weight:700;\">From:</span><span class=\"value from-value\">{sender_value_html}</span></div>
+                    <div class=\"header-item\"><span class=\"label\" style=\"font-weight:700;\">To:</span><span class=\"value\">{html.escape(recipient_display or recipient)}</span></div>
+                    <div class=\"header-item\"><span class=\"label\" style=\"font-weight:700;\">Subject:</span><span class=\"value subject-value\">{html.escape(subject)}</span></div>
+                    <div class=\"header-item\"><span class=\"label\" style=\"font-weight:700;\">Date:</span><span class=\"value\">{html.escape(date_display)}</span></div>
                     {cc_html or ''}
                 </div>
                 <div class=\"email-body\">{body}</div>
@@ -1297,6 +1346,42 @@ class PDFGenerationService:
                         )
                         logger.info(
                             f"PAGE BREAK DIAGNOSTIC: Page layout info: {page_info}"
+                        )
+
+                        # After diagnostics, enforce grouping of inline forwarded headers in DOM
+                        page.evaluate(
+                            """
+                                () => {
+                                  try {
+                                    const body = document.querySelector('.email-body') || document.body;
+                                    const candidates = Array.from(body.querySelectorAll('div, p, blockquote, td, span'));
+                                    const pattern = /(From:)[\s\S]*?(Sent:|Date:)[\s\S]*?To:[\s\S]*?(?:Cc:[\s\S]*?)?Subject:/i;
+                                    let wrappedCount = 0;
+                                    for (const el of candidates) {
+                                      if (!(el instanceof Element)) continue;
+                                      if (el.closest('.forwarded-header-block')) continue;
+                                      const html = el.innerHTML || '';
+                                      if (!html) continue;
+                                      if (pattern.test(html)) {
+                                        const wrapper = document.createElement('div');
+                                        wrapper.className = 'forwarded-header-block';
+                                        wrapper.style.pageBreakInside = 'avoid';
+                                        wrapper.style.breakInside = 'avoid';
+                                        wrapper.style.display = 'inline-block';
+                                        wrapper.style.width = '100%';
+                                        el.style.pageBreakInside = 'avoid';
+                                        el.style.breakInside = 'avoid';
+                                        el.parentNode.insertBefore(wrapper, el);
+                                        wrapper.appendChild(el);
+                                        wrappedCount++;
+                                      }
+                                    }
+                                    return { forwardedWrapped: wrappedCount };
+                                  } catch (e) {
+                                    return { error: String(e) };
+                                  }
+                                }
+                            """
                         )
                     except Exception as eval_e:
                         logger.warning(f"Page evaluation failed: {eval_e}")
