@@ -20,7 +20,7 @@ import textwrap
 import time
 import traceback
 from html.parser import HTMLParser
-from typing import Optional
+from typing import Optional, Union
 
 import email
 from email.policy import default
@@ -44,6 +44,54 @@ from image_processing import (
 from email_body_processing import extract_body_and_images_from_email
 from email_header import collect_header_context
 from pdf_settings import resolve_pdf_layout_settings
+
+
+_INCH_TO_PX = 96.0
+_PAGE_DIMENSIONS_IN = {
+    "letter": (8.5, 11.0),
+    "legal": (8.5, 14.0),
+    "a4": (8.27, 11.69),
+    "a3": (11.69, 16.54),
+    "tabloid": (11.0, 17.0),
+}
+
+
+def _inches_to_px(value: float | int) -> float:
+    try:
+        return float(value) * _INCH_TO_PX
+    except Exception:
+        return 0.0
+
+
+def _length_to_px(value: Union[str, float, int, None]) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    candidate = str(value).strip().lower()
+    if not candidate:
+        return 0.0
+
+    match = re.match(r"([-+]?\d*\.\d+|[-+]?\d+)(\s*(in|inch|inches|cm|mm|pt|px))?", candidate)
+    if not match:
+        try:
+            return float(candidate)
+        except Exception:
+            return 0.0
+
+    number = float(match.group(1))
+    unit = (match.group(3) or "px").lower()
+
+    if unit in ("in", "inch", "inches"):
+        return number * _INCH_TO_PX
+    if unit == "cm":
+        return number * (_INCH_TO_PX / 2.54)
+    if unit == "mm":
+        return number * (_INCH_TO_PX / 25.4)
+    if unit == "pt":
+        return number * (_INCH_TO_PX / 72.0)
+    return number
 
 
 def _style_flags_from_attrs(attrs: dict[str, str]) -> tuple[bool, bool]:
@@ -619,8 +667,8 @@ class PDFGenerationService:
                         color: #1f1f1f;
                         page-break-before: avoid !important;
                         break-before: avoid !important;
-                        page-break-after: avoid !important;
-                        break-after: avoid !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
                         page-break-inside: avoid !important;
                         break-inside: avoid !important;
                         display: block !important;
@@ -738,21 +786,32 @@ class PDFGenerationService:
                         padding: 0 !important;
                         page-break-before: auto !important;
                         break-before: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
                         page-break-inside: auto !important;
                         break-inside: auto !important;
                     }}
                     .image-attachments img {{
                         max-width: 100%;
                         height: auto;
+                        max-height: none;
+                        width: auto;
+                        object-fit: contain;
                         display: block;
-                        margin: 0 auto 10px;
-                        page-break-inside: avoid;
-                        break-inside: avoid;
+                        margin: 8px auto 10px;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-inside: auto;
+                        break-inside: auto;
                     }}
                     .inline-attachment {{
-                        margin: 16px 0;
-                        page-break-inside: avoid;
-                        break-inside: avoid;
+                        margin: 8px 0 16px 0;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
+                        page-break-inside: auto;
+                        break-inside: auto;
                     }}
                     .inline-attachment figcaption {{
                         font-size: 11px;
@@ -1317,6 +1376,22 @@ class PDFGenerationService:
                     pdf_margins["left"] = "0.5in"
                     pdf_margins["right"] = "0.5in"
 
+                    margin_top_px = _length_to_px(pdf_margins.get("top"))
+                    margin_bottom_px = _length_to_px(pdf_margins.get("bottom"))
+                    format_key = str(page_format or "Letter").lower()
+                    page_dims = _PAGE_DIMENSIONS_IN.get(format_key, _PAGE_DIMENSIONS_IN.get("letter", (8.5, 11.0)))
+                    page_height_px = _inches_to_px(page_dims[1])
+                    available_body_height_px = max(page_height_px - margin_top_px - margin_bottom_px, 0.0)
+                    inline_image_padding_px = _inches_to_px(0.5)
+                    min_inline_image_height_px = _inches_to_px(1.25)
+
+                    logger.info(
+                        "PAGE DIMENSIONS: format=%s height_px=%.2f available_body_px=%.2f",
+                        page_format,
+                        page_height_px,
+                        available_body_height_px,
+                    )
+
                     logger.info(
                         f"PAGE BREAK DIAGNOSTIC: Using minimal PDF margins: {pdf_margins}"
                     )
@@ -1383,6 +1458,68 @@ class PDFGenerationService:
                                 }
                             """
                         )
+
+                        try:
+                            image_adjustment = page.evaluate(
+                                f"""
+                                    () => {{
+                                      try {{
+                                        const header = document.querySelector('.email-header');
+                                        const attachments = Array.from(document.querySelectorAll('.image-attachments img'));
+                                        if (!attachments.length) {{
+                                          return {{ adjusted: false, reason: 'no inline attachments' }};
+                                        }}
+
+                                        const available = {available_body_height_px:.2f};
+                                        const padding = {inline_image_padding_px:.2f};
+                                        const minHeight = {min_inline_image_height_px:.2f};
+                                        const headerHeight = header ? header.getBoundingClientRect().height : 0;
+
+                                        let candidate = available - headerHeight - padding;
+                                        if (!Number.isFinite(candidate) || candidate <= 0) {{
+                                          candidate = available - padding;
+                                        }}
+                                        if (!Number.isFinite(candidate) || candidate <= 0) {{
+                                          candidate = available * 0.85;
+                                        }}
+
+                                        let maxHeight = Math.max(minHeight, Math.min(candidate, available - padding));
+                                        if (!Number.isFinite(maxHeight) || maxHeight <= 0) {{
+                                          maxHeight = Math.max(minHeight, available * 0.75);
+                                        }}
+
+                                        attachments.forEach((img) => {{
+                                          img.style.maxHeight = `${{maxHeight}}px`;
+                                          img.style.height = 'auto';
+                                          img.style.width = 'auto';
+                                          img.style.objectFit = 'contain';
+                                          img.style.pageBreakBefore = 'auto';
+                                          img.style.pageBreakInside = 'auto';
+                                          img.style.pageBreakAfter = 'auto';
+                                          img.style.breakBefore = 'auto';
+                                          img.style.breakInside = 'auto';
+                                          img.style.breakAfter = 'auto';
+                                        }});
+
+                                        return {{
+                                          adjusted: true,
+                                          attachmentCount: attachments.length,
+                                          headerHeight,
+                                          available,
+                                          maxHeight,
+                                        }};
+                                      }} catch (error) {{
+                                        console.warn('INLINE IMAGE ADJUSTMENT ERROR', error);
+                                        return {{ adjusted: false, error: String(error) }};
+                                      }}
+                                    }}
+                                """
+                            )
+                            logger.info(f"INLINE IMAGE ADJUSTMENT: {image_adjustment}")
+                        except Exception as adjust_error:
+                            logger.warning(
+                                f"Failed to adjust inline image heights: {adjust_error}"
+                            )
                     except Exception as eval_e:
                         logger.warning(f"Page evaluation failed: {eval_e}")
 

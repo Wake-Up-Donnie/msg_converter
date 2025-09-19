@@ -6,7 +6,7 @@ import os
 import re
 from typing import Dict, List, Tuple
 
-from html_processing import append_html_after_body_content
+from html_processing import append_html_after_body_content, normalize_body_html_fragment
 
 
 logger = logging.getLogger(__name__)
@@ -241,7 +241,21 @@ def inline_image_attachments_into_body(
             + ''.join(inline_figures)
             + '</div>'
         )
-        body_html = append_html_after_body_content(body_html, wrapper)
+
+        normalized_body = normalize_body_html_fragment(body_html)
+
+        def _has_meaningful_content(fragment: str) -> bool:
+            if not fragment:
+                return False
+            stripped = re.sub(r'<[^>]+>', '', fragment)
+            stripped = html.unescape(stripped or '')
+            stripped = re.sub(r'[\s\u00A0\u2000-\u200B\u202F\u205F\u3000]+', '', stripped)
+            return bool(stripped)
+
+        if _has_meaningful_content(normalized_body):
+            body_html = append_html_after_body_content(normalized_body, wrapper)
+        else:
+            body_html = wrapper
     return body_html, remaining, inlined_names
 
 
