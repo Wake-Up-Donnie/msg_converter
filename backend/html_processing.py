@@ -206,6 +206,196 @@ def normalize_body_html_fragment(fragment: str | None) -> str:
     return _strip_trailing_empty_html(_strip_leading_empty_html(fragment))
 
 
+_FORWARDED_BLOCK_ELEMENT_RE = re.compile(
+    r'<(div|p|blockquote)\b[^>]*>.*?</\1>'
+    r"|<table\b[^>]*>.*?</table>"
+    r"|<tr\b[^>]*>.*?</tr>"
+    r"|<td\b[^>]*>.*?</td>"
+    r"|<span\b[^>]*>.*?</span>",
+    re.IGNORECASE | re.DOTALL,
+)
+_FORWARDED_LABEL_RE = re.compile(
+    r'^([A-Za-z][A-Za-z0-9 .,/&\-]{0,40}?)\s*:',
+    re.IGNORECASE,
+)
+_FORWARDED_ALLOWED_LABELS = {
+    'from',
+    'sent',
+    'date',
+    'to',
+    'cc',
+    'subject',
+    'bcc',
+    'reply-to',
+    'reply to',
+}
+_FORWARDED_REQUIRED_LABELS = {'from', 'to', 'subject'}
+
+
+def _strip_html_to_text(fragment: str) -> str:
+    if not fragment:
+        return ''
+    text = re.sub(r'<[^>]+>', ' ', fragment)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def _gap_is_trivial(gap: str) -> bool:
+    if not gap.strip():
+        return True
+
+    gap = re.sub(r'<!--[\s\S]*?-->', '', gap)
+    gap_no_tags = re.sub(r'<[^>]+>', '', gap)
+    if not gap_no_tags.strip():
+        return True
+
+    gap_text = html.unescape(gap_no_tags)
+    gap_text = re.sub(r'[\s\u00A0\u2000-\u200B\u202F\u205F\u3000]+', '', gap_text)
+    return gap_text == ''
+
+
+def wrap_forwarded_header_blocks(fragment: str | None) -> str:
+    if not fragment:
+        return fragment or ''
+
+    matches = list(_FORWARDED_BLOCK_ELEMENT_RE.finditer(fragment))
+    if not matches:
+        return fragment
+
+    sequences: list[tuple[int, int]] = []
+    consumed_indices: set[int] = set()
+
+    for idx, match in enumerate(matches):
+        content_html = match.group(0)
+        content_text = _strip_html_to_text(content_html)
+        if not content_text:
+            continue
+
+        labels_found: list[str] = []
+        for label_match in _FORWARDED_LABEL_RE.finditer(content_text):
+            normalized = label_match.group(1).strip().lower().rstrip('.')
+            normalized = normalized.replace('\u2019', "'")
+            normalized = normalized.replace('\u2013', '-')
+            normalized = normalized.replace('\u2014', '-')
+            normalized = 'reply-to' if normalized in {'reply-to', 'reply to'} else normalized
+            if normalized in _FORWARDED_ALLOWED_LABELS:
+                labels_found.append(normalized)
+
+        label_set = set(labels_found)
+        if (
+            labels_found
+            and _FORWARDED_REQUIRED_LABELS.issubset(label_set)
+            and label_set & {'sent', 'date'}
+        ):
+            sequences.append((match.start(), match.end()))
+            consumed_indices.add(idx)
+
+    total = len(matches)
+    idx = 0
+
+    while idx < total:
+        if idx in consumed_indices:
+            idx += 1
+            continue
+        seq_indices: list[int] = []
+        labels_in_sequence: list[str] = []
+        j = idx
+
+        while j < total:
+            match = matches[j]
+            content_html = match.group(0)
+            content_text = _strip_html_to_text(content_html)
+            if not content_text:
+                break
+
+            label_match = _FORWARDED_LABEL_RE.match(content_text)
+            if not label_match:
+                break
+
+            label = label_match.group(1).strip().lower().rstrip('.')
+            label = label.replace('\u2019', "'")
+            label = label.replace('\u2013', '-')
+            label = label.replace('\u2014', '-')
+            if label not in _FORWARDED_ALLOWED_LABELS:
+                break
+
+            seq_indices.append(j)
+            normalized_label = 'reply-to' if label in {'reply-to', 'reply to'} else label
+            labels_in_sequence.append(normalized_label)
+
+            j += 1
+
+            if j < total:
+                gap = fragment[match.end():matches[j].start()]
+                if not _gap_is_trivial(gap):
+                    break
+
+            if len(seq_indices) >= 8:
+                break
+
+        if seq_indices:
+            label_set = set(labels_in_sequence)
+            if (
+                len(seq_indices) >= 3
+                and _FORWARDED_REQUIRED_LABELS.issubset(label_set)
+                and (label_set & {'sent', 'date'})
+            ):
+                start = matches[seq_indices[0]].start()
+                end = matches[seq_indices[-1]].end()
+                sequences.append((start, end))
+                idx = seq_indices[-1] + 1
+                continue
+
+        idx += 1
+
+    if not sequences:
+        return fragment
+
+    wrapped = fragment
+    for start, end in sorted(sequences, reverse=True):
+        chunk = wrapped[start:end]
+        if 'forwarded-header-block' in chunk:
+            continue
+        wrapped = wrapped[:start] + (
+            '<div class="forwarded-header-block">' + chunk + '</div>'
+        ) + wrapped[end:]
+
+    if 'Cc:' in wrapped and 'forwarded-header-block' not in wrapped:
+        wrapped = re.sub(
+            r'(<[^>]+>)*Cc:(.*?)(Subject:.*?)(?=<|$)',
+            r'<div class="forwarded-header-block">\g<0></div>',
+            wrapped,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    if 'forwarded-header-block' not in wrapped:
+        INLINE_FWD = re.compile(
+            r"""
+            (
+                (?:(?:<[^>]+>)*\s*)
+                (?:(?:<b[^>]*>)?\s*)from\s*:.*?(?:<br\s*/?>|</p>|</div>|</span>)
+                [\s\S]*?
+                (?:(?:<b[^>]*>)?\s*(?:sent|date)\s*:.*?(?:<br\s*/?>|</p>|</div>|</span>))
+                [\s\S]*?
+                (?:(?:<b[^>]*>)?\s*to\s*:.*?(?:<br\s*/?>|</p>|</div>|</span>))
+                [\s\S]*?
+                (?:(?:<b[^>]*>)?\s*cc\s*:.*?(?:<br\s*/?>|</p>|</div>|</span>))?
+                [\s\S]*?
+                (?:(?:<b[^>]*>)?\s*subject\s*:.*?)
+            )
+            """,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        def _wrap_inline(m: re.Match) -> str:
+            return f'<div class="forwarded-header-block">{m.group(0)}</div>'
+
+        wrapped = INLINE_FWD.sub(_wrap_inline, wrapped)
+
+    return wrapped
+
+
 def append_html_after_body_content(body_html: str | None, addition: str) -> str:
     if not addition:
         return body_html or ''

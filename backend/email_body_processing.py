@@ -15,6 +15,7 @@ from html_processing import (
     extract_style_blocks,
     normalize_body_html_fragment,
     normalize_whitespace,
+    wrap_forwarded_header_blocks,
     strip_word_section_wrappers,
 )
 from image_processing import (
@@ -512,6 +513,17 @@ def extract_body_and_images_from_email(
             word_cleanup.get("class_refs_removed", 0),
         )
 
+    try:
+        _b = body.count('forwarded-header-block') if body else 0
+    except Exception:
+        _b = 0
+    body = wrap_forwarded_header_blocks(body)
+    try:
+        _a = body.count('forwarded-header-block') if body else 0
+    except Exception:
+        _a = 0
+    logger.info("FORWARDED WRAP (extract): before=%s, after=%s", _b, _a)
+
     extract_body_and_images_from_email.last_collected_styles = collected_styles
     return body, images, attachments
 
@@ -520,4 +532,3 @@ __all__ = [
     "extract_body_and_images_from_email",
     "get_part_content",
 ]
-

@@ -59,7 +59,8 @@ def collect_header_context(msg: Message) -> EmailHeaderContext:
         cc_display = cc_compact or cc_formatted
         escaped = html.escape(cc_display)
         cc_html = (
-            '<div class="header-item"><span class="label">Cc:</span>'
+            '<div class="header-item cc-item">'
+            '<span class="label" style="font-weight:700;">CC:</span>'
             f'<span class="value">{escaped}</span></div>'
         )
 
@@ -78,4 +79,3 @@ def collect_header_context(msg: Message) -> EmailHeaderContext:
 
 
 __all__ = ["EmailHeaderContext", "collect_header_context"]
-
