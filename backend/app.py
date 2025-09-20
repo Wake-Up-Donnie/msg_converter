@@ -11,6 +11,8 @@ from email.policy import default
 from email.generator import BytesGenerator
 from playwright.sync_api import sync_playwright
 from pypdf import PdfReader, PdfWriter
+from pdf_settings import resolve_pdf_layout_settings
+from image_processing import ensure_displayable_image_bytes
 import boto3
 from datetime import datetime, timedelta
 from functools import wraps
@@ -619,9 +621,15 @@ class EMLToPDFConverter:
                         vertical-align: -0.1em;
                     }}
                     .email-header {{
-                        margin-bottom: 24px;
+                        margin-bottom: 16px;
                         color: #202124;
                         font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+                        page-break-before: avoid !important;
+                        break-before: avoid !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
+                        page-break-inside: avoid !important;
+                        break-inside: avoid !important;
                     }}
                     .email-header .email-header-table {{
                         width: 100%;
@@ -661,16 +669,26 @@ class EMLToPDFConverter:
                         margin: 0 auto;
                         white-space: pre-wrap;
                         word-wrap: break-word;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
                     }}
                     img {{
                         max-width: 100%;
                         height: auto;
                         display: block;
-                        margin: 10px 0;
+                        margin: 8px 0 10px 0;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
                     }}
                     .inline-image {{
                         max-width: 100%;
                         height: auto;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
                     }}
                 </style>
             </head>
@@ -903,8 +921,14 @@ class EMLToPDFConverter:
                 if ctype.startswith('image/') and not in_nested:
                     img_bytes = part.get_payload(decode=True)
                     if img_bytes:
-                        b64 = base64.b64encode(img_bytes).decode('utf-8')
-                        data_url = f"data:{ctype};base64,{b64}"
+                        # Convert non-browser-friendly formats (e.g., TIFF) to PNG
+                        display_bytes, usable_type = ensure_displayable_image_bytes(
+                            img_bytes,
+                            ctype,
+                            source_name=fname or cloc or cid,
+                        )
+                        b64 = base64.b64encode(display_bytes or img_bytes).decode('utf-8')
+                        data_url = f"data:{usable_type or ctype};base64,{b64}"
                         keys = set()
                         if cid:
                             keys.add(f"cid:{cid}")
@@ -1336,15 +1360,44 @@ class EMLToPDFConverter:
                 # Give time for resources
                 page.wait_for_timeout(500)
 
+                # Use shared page size/margins and reduce margins to allow inline media under header
+                page_format, page_margins = resolve_pdf_layout_settings()
+                pdf_margins = page_margins.copy()
+                pdf_margins['top'] = '0.3in'
+                pdf_margins['bottom'] = '0.3in'
+                pdf_margins['left'] = '0.5in'
+                pdf_margins['right'] = '0.5in'
+
+                # Dynamically cap inline image height so large images start under header
+                try:
+                    page.evaluate(
+                        """
+                        (() => {
+                          try {
+                            const header = document.querySelector('.email-header');
+                            const imgs = Array.from(document.querySelectorAll('.content img'));
+                            const vh = window.innerHeight || 800; // viewport as proxy
+                            const headerH = header ? header.getBoundingClientRect().height : 0;
+                            const padding = 40; // px buffer
+                            let maxH = Math.max(120, Math.min(vh - headerH - padding, vh - padding));
+                            imgs.forEach(img => {
+                              img.style.maxHeight = `${maxH}px`;
+                              img.style.objectFit = 'contain';
+                            });
+                            return { adjusted: true, maxH, headerH, count: imgs.length };
+                          } catch (e) {
+                            return { adjusted: false, error: String(e) };
+                          }
+                        })();
+                        """
+                    )
+                except Exception as _:
+                    pass
+
                 page.pdf(
                     path=output_path,
-                    format='A4',
-                    margin={
-                        'top': '1in',
-                        'right': '1in',
-                        'bottom': '1in',
-                        'left': '1in'
-                    },
+                    format=page_format,
+                    margin=pdf_margins,
                     print_background=True,
                     prefer_css_page_size=False
                 )
