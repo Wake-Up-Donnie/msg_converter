@@ -706,22 +706,31 @@ class PDFGenerationService:
                         font-weight: 600 !important;
                     }}
                     .forwarded-header-block {{
-                        margin: 8px 0 10px;
+                        margin: 12px 0 12px;
                         padding: 0;
-                        display: inline-block; /* Chromium tends to honor non-fragmentation better */
-                        width: 100%;
+                        display: block;
+                        width: auto;
                         vertical-align: top;
-                        page-break-before: avoid !important;
-                        break-before: avoid !important;
-                        page-break-after: avoid !important;
-                        break-after: avoid !important;
-                        page-break-inside: avoid !important;
-                        break-inside: avoid !important;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
                     }}
                     .forwarded-header-block > * {{
-                        page-break-inside: avoid !important;
-                        break-inside: avoid !important;
-                        margin: 0 !important;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
+                        margin-top: 0 !important;
+                        padding-top: 0 !important;
+                    }}
+                    .forwarded-header-block * {{
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
                     }}
                     .email-body {{
                         margin: 0 !important;
@@ -733,6 +742,13 @@ class PDFGenerationService:
                     }}
                     .email-body > *:first-child {{
                         margin-top: 0 !important;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                    }}
+                    #ms-outlook-mobile-signature,
+                    #ms-outlook-mobile-signature > * {{
+                        margin-top: 0 !important;
+                        padding-top: 0 !important;
                         page-break-before: auto !important;
                         break-before: auto !important;
                     }}
@@ -754,6 +770,12 @@ class PDFGenerationService:
                         max-height: none !important;
                         min-width: 0 !important;
                         min-height: 0 !important;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
                     }}
                     .email-body p {{
                         margin: 0 0 4px 0 !important;
@@ -1425,32 +1447,87 @@ class PDFGenerationService:
 
                         # After diagnostics, enforce grouping of inline forwarded headers in DOM
                         page.evaluate(
-                            """
+                            r"""
                                 () => {
                                   try {
                                     const body = document.querySelector('.email-body') || document.body;
-                                    const candidates = Array.from(body.querySelectorAll('div, p, blockquote, td, span'));
                                     const pattern = /(From:)[\s\S]*?(Sent:|Date:)[\s\S]*?To:[\s\S]*?(?:Cc:[\s\S]*?)?Subject:/i;
-                                    let wrappedCount = 0;
-                                    for (const el of candidates) {
-                                      if (!(el instanceof Element)) continue;
-                                      if (el.closest('.forwarded-header-block')) continue;
-                                      const html = el.innerHTML || '';
-                                      if (!html) continue;
-                                      if (pattern.test(html)) {
-                                        const wrapper = document.createElement('div');
-                                        wrapper.className = 'forwarded-header-block';
-                                        wrapper.style.pageBreakInside = 'avoid';
-                                        wrapper.style.breakInside = 'avoid';
-                                        wrapper.style.display = 'inline-block';
-                                        wrapper.style.width = '100%';
-                                        el.style.pageBreakInside = 'avoid';
-                                        el.style.breakInside = 'avoid';
-                                        el.parentNode.insertBefore(wrapper, el);
-                                        wrapper.appendChild(el);
-                                        wrappedCount++;
+                                    const wrapperClass = 'forwarded-header-block';
+
+                                    const isAlreadyWrapped = (el) => {
+                                      if (!el) return false;
+                                      if (el.classList && el.classList.contains(wrapperClass)) return true;
+                                      return !!el.closest(`.${wrapperClass}`);
+                                    };
+
+                                    const matchesForwardedPattern = (node) => {
+                                      if (!node || !pattern.test(node.innerHTML || '')) return false;
+                                      const text = (node.textContent || '').toLowerCase();
+                                      const labels = ['from:', 'to:', 'subject:'];
+                                      return labels.every(label => text.includes(label));
+                                    };
+
+                                    const collectSegments = () => {
+                                      const segments = [];
+                                      let current = [];
+                                      const children = Array.from(body.children || []);
+                                      const isVisual = (el) => {
+                                        if (!el) return false;
+                                        if (el.querySelector('img, table, hr')) return true;
+                                        const text = (el.textContent || '').replace(/[\s\u00A0]+/g, '');
+                                        return text.length > 60;
+                                      };
+
+                                      for (const child of children) {
+                                        if (isAlreadyWrapped(child)) continue;
+                                        if (!current.length && matchesForwardedPattern(child)) {
+                                          current.push(child);
+                                          continue;
+                                        }
+                                        if (current.length) {
+                                          if (isVisual(child)) {
+                                            segments.push(current.slice());
+                                            current = [];
+                                            continue;
+                                          }
+                                          current.push(child);
+                                          const text = (child.textContent || '').toLowerCase();
+                                          if (text.includes('subject:')) {
+                                            segments.push(current.slice());
+                                            current = [];
+                                          }
+                                        }
                                       }
-                                    }
+                                      if (current.length) {
+                                        segments.push(current.slice());
+                                      }
+                                      return segments;
+                                    };
+
+                                    const segments = collectSegments();
+                                    let wrappedCount = 0;
+                                    segments.forEach(nodes => {
+                                      if (!nodes.length) return;
+                                      const first = nodes[0];
+                                      if (!first || isAlreadyWrapped(first)) return;
+                                      const wrapper = document.createElement('div');
+                                      wrapper.className = wrapperClass;
+                                      wrapper.style.display = 'block';
+                                      wrapper.style.margin = '12px 0';
+                                      wrapper.style.padding = '0';
+                                      wrapper.style.breakBefore = 'auto';
+                                      wrapper.style.breakAfter = 'auto';
+                                      wrapper.style.breakInside = 'auto';
+                                      wrapper.style.pageBreakBefore = 'auto';
+                                      wrapper.style.pageBreakAfter = 'auto';
+                                      wrapper.style.pageBreakInside = 'auto';
+                                      first.parentNode.insertBefore(wrapper, first);
+                                      nodes.forEach(node => {
+                                        wrapper.appendChild(node);
+                                      });
+                                      wrappedCount += 1;
+                                    });
+
                                     return { forwardedWrapped: wrappedCount };
                                   } catch (e) {
                                     return { error: String(e) };
@@ -1458,6 +1535,166 @@ class PDFGenerationService:
                                 }
                             """
                         )
+
+                        try:
+                            leading_cleanup = page.evaluate(
+                                r"""
+                                    () => {
+                                      try {
+                                        const root = document.querySelector('.email-body');
+                                        if (!root) {
+                                          return { removed: 0, reason: 'missing-root' };
+                                        }
+
+                                        const stripBreakStyles = (el) => {
+                                          if (!el || typeof el.getAttribute !== 'function') return;
+                                          const attr = el.getAttribute('style');
+                                          if (attr) {
+                                            const cleaned = attr.replace(/(?:^|;)\s*(?:-?webkit-)?(?:column-)?(?:page-)?break-[^;]+;?/gi, ';');
+                                            if (cleaned !== attr) {
+                                              el.setAttribute('style', cleaned);
+                                            }
+                                          }
+                                        };
+
+                                        const resetBreakProps = (el) => {
+                                          if (!el || !el.style) return;
+                                          stripBreakStyles(el);
+                                          const props = [
+                                            'break-before',
+                                            'break-after',
+                                            'break-inside',
+                                            'page-break-before',
+                                            'page-break-after',
+                                            'page-break-inside',
+                                            '-webkit-column-break-before',
+                                            '-webkit-column-break-after',
+                                            '-webkit-column-break-inside'
+                                          ];
+                                          props.forEach(prop => {
+                                            el.style.setProperty(prop, 'auto', 'important');
+                                          });
+                                        };
+
+                                        const clearInlineBreaks = (container) => {
+                                          if (!container) return 0;
+                                          let pruned = 0;
+                                          while (container.firstChild && container.firstChild.nodeType === Node.TEXT_NODE && (container.firstChild.textContent || '').trim() === '') {
+                                            container.removeChild(container.firstChild);
+                                            pruned += 1;
+                                          }
+                                          while (container.firstElementChild && container.firstElementChild.tagName === 'BR') {
+                                            container.removeChild(container.firstElementChild);
+                                            pruned += 1;
+                                          }
+                                          return pruned;
+                                        };
+
+                                        const isTrulyEmpty = (el) => {
+                                          if (!el) return false;
+                                          if (el.querySelector('img, svg, video, canvas, object, embed, iframe')) return false;
+                                          const text = (el.textContent || '').replace(/[\s\u00A0]+/g, '');
+                                          if (text.length > 0) return false;
+                                          const hasVisual = Array.from(el.querySelectorAll('table, hr')).some((node) => {
+                                            if (node.querySelector('img, svg, video, canvas, object, embed, iframe')) return true;
+                                            const t = (node.textContent || '').replace(/[\s\u00A0]+/g, '');
+                                            return t.length > 0;
+                                          });
+                                          if (hasVisual) return false;
+                                          return true;
+                                        };
+
+                                        let removed = 0;
+                                        removed += clearInlineBreaks(root);
+                                        while (root.firstElementChild && isTrulyEmpty(root.firstElementChild)) {
+                                          root.removeChild(root.firstElementChild);
+                                          removed += 1;
+                                          removed += clearInlineBreaks(root);
+                                        }
+
+                                        root.style.marginTop = '0px';
+                                        root.style.paddingTop = '0px';
+                                        resetBreakProps(root);
+                                        Array.from(root.querySelectorAll('[style*="break"],[style*="page-break"],[style*="column-break"]'))
+                                          .forEach(resetBreakProps);
+                                        const zeroOut = (el) => {
+                                          if (!el) return;
+                                          el.style.marginTop = '0px';
+                                          el.style.paddingTop = '0px';
+                                          el.style.pageBreakBefore = 'auto';
+                                          el.style.breakBefore = 'auto';
+                                          resetBreakProps(el);
+                                        };
+                                        const first = root.firstElementChild;
+                                        zeroOut(first);
+                                        if (first && first.firstElementChild) {
+                                          removed += clearInlineBreaks(first);
+                                          zeroOut(first.firstElementChild);
+                                        }
+                                        if (first) {
+                                          Array.from(first.querySelectorAll('[style*="break"],[style*="page-break"],[style*="column-break"]'))
+                                            .forEach(resetBreakProps);
+                                          if (first.classList && first.classList.contains('forwarded-header-block')) {
+                                            const snippet = (first.textContent || '').slice(0, 200).toLowerCase();
+                                            const hasForwardLabels = snippet.includes('from:') && snippet.indexOf('from:') < 60;
+                                            if (!hasForwardLabels) {
+                                              while (first.firstChild) {
+                                                root.insertBefore(first.firstChild, first);
+                                              }
+                                              first.remove();
+                                              removed += clearInlineBreaks(root);
+                                            }
+                                          }
+                                        }
+
+                                        removed += clearInlineBreaks(root);
+                                        return { removed };
+                                      } catch (error) {
+                                        return { removed: 0, error: String(error) };
+                                      }
+                                    }
+                                """
+                            )
+                            logger.info(f"LEADING WHITESPACE CLEANUP: {leading_cleanup}")
+                        except Exception as cleanup_error:
+                            logger.warning(
+                                f"Failed to prune leading empty blocks: {cleanup_error}"
+                            )
+
+                        try:
+                            first_block_info = page.evaluate(
+                                r"""
+                                    () => {
+                                      try {
+                                        const root = document.querySelector('.email-body');
+                                        if (!root) {
+                                          return { reason: 'missing-root' };
+                                        }
+                                        const first = root.firstElementChild;
+                                        if (!first) {
+                                          return { reason: 'no-first-element' };
+                                        }
+                                        const style = window.getComputedStyle(first);
+                                        const rect = first.getBoundingClientRect();
+                                        return {
+                                          tag: first.tagName,
+                                          classes: Array.from(first.classList || []),
+                                          marginTop: style.marginTop,
+                                          paddingTop: style.paddingTop,
+                                          breakBefore: style.breakBefore || style.pageBreakBefore || null,
+                                          offsetTop: first.offsetTop || 0,
+                                          bboxTop: rect ? rect.top : null,
+                                          htmlPreview: (first.innerHTML || '').slice(0, 160)
+                                        };
+                                      } catch (error) {
+                                        return { error: String(error) };
+                                      }
+                                    }
+                                """
+                            )
+                            logger.info(f"CONTENT START DIAGNOSTIC: {first_block_info}")
+                        except Exception as diag_error:
+                            logger.warning(f"Failed to inspect first content block: {diag_error}")
 
                         try:
                             image_adjustment = page.evaluate(

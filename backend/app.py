@@ -671,6 +671,42 @@ class EMLToPDFConverter:
                         word-wrap: break-word;
                         page-break-before: auto !important;
                         break-before: auto !important;
+                        margin-top: 0 !important;
+                        padding-top: 0 !important;
+                    }}
+                    .content > *:first-child {{
+                        margin-top: 0 !important;
+                        padding-top: 0 !important;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                    }}
+                    .forwarded-header-block {{
+                        margin: 12px 0 12px;
+                        padding: 0;
+                        display: block;
+                        width: auto;
+                        vertical-align: top;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
+                    }}
+                    .forwarded-header-block * {{
+                        page-break-before: auto !important;
+                        break-before: auto !important;
+                        page-break-after: auto !important;
+                        break-after: auto !important;
+                        page-break-inside: auto !important;
+                        break-inside: auto !important;
+                    }}
+                    #ms-outlook-mobile-signature,
+                    #ms-outlook-mobile-signature > * {{
+                        margin-top: 0 !important;
+                        padding-top: 0 !important;
+                        page-break-before: auto !important;
+                        break-before: auto !important;
                     }}
                     img {{
                         max-width: 100%;
@@ -1359,6 +1395,165 @@ class EMLToPDFConverter:
 
                 # Give time for resources
                 page.wait_for_timeout(500)
+
+                try:
+                    cleanup_result = page.evaluate(
+                        r"""
+                            () => {
+                              try {
+                                const root = document.querySelector('.email-body');
+                                if (!root) {
+                                  return { removed: 0, reason: 'missing-root' };
+                                }
+
+                                const stripBreakStyles = (el) => {
+                                  if (!el || typeof el.getAttribute !== 'function') return;
+                                  const attr = el.getAttribute('style');
+                                  if (attr) {
+                                    const cleaned = attr.replace(/(?:^|;)\s*(?:-?webkit-)?(?:column-)?(?:page-)?break-[^;]+;?/gi, ';');
+                                    if (cleaned !== attr) {
+                                      el.setAttribute('style', cleaned);
+                                    }
+                                  }
+                                };
+
+                                const resetBreakProps = (el) => {
+                                  if (!el || !el.style) return;
+                                  stripBreakStyles(el);
+                                  const props = [
+                                    'break-before',
+                                    'break-after',
+                                    'break-inside',
+                                    'page-break-before',
+                                    'page-break-after',
+                                    'page-break-inside',
+                                    '-webkit-column-break-before',
+                                    '-webkit-column-break-after',
+                                    '-webkit-column-break-inside'
+                                  ];
+                                  props.forEach(prop => {
+                                    el.style.setProperty(prop, 'auto', 'important');
+                                  });
+                                };
+
+                                const clearInlineBreaks = (container) => {
+                                  if (!container) return 0;
+                                  let pruned = 0;
+                                  while (container.firstChild && container.firstChild.nodeType === Node.TEXT_NODE && (container.firstChild.textContent || '').trim() === '') {
+                                    container.removeChild(container.firstChild);
+                                    pruned += 1;
+                                  }
+                                  while (container.firstElementChild && container.firstElementChild.tagName === 'BR') {
+                                    container.removeChild(container.firstElementChild);
+                                    pruned += 1;
+                                  }
+                                  return pruned;
+                                };
+
+                                const isTrulyEmpty = (el) => {
+                                  if (!el) return false;
+                                  if (el.querySelector('img, svg, video, canvas, object, embed, iframe')) return false;
+                                  const text = (el.textContent || '').replace(/[\s\u00A0]+/g, '');
+                                  if (text.length > 0) return false;
+                                  const hasVisual = Array.from(el.querySelectorAll('table, hr')).some((node) => {
+                                    if (node.querySelector('img, svg, video, canvas, object, embed, iframe')) return true;
+                                    const t = (node.textContent || '').replace(/[\s\u00A0]+/g, '');
+                                    return t.length > 0;
+                                  });
+                                  if (hasVisual) return false;
+                                  return true;
+                                };
+
+                                let removed = 0;
+                                removed += clearInlineBreaks(root);
+                                while (root.firstElementChild && isTrulyEmpty(root.firstElementChild)) {
+                                  root.removeChild(root.firstElementChild);
+                                  removed += 1;
+                                  removed += clearInlineBreaks(root);
+                                }
+
+                                root.style.marginTop = '0px';
+                                root.style.paddingTop = '0px';
+                                resetBreakProps(root);
+                                Array.from(root.querySelectorAll('[style*="break"],[style*="page-break"],[style*="column-break"]'))
+                                  .forEach(resetBreakProps);
+
+                                const zeroOut = (el) => {
+                                  if (!el) return;
+                                  el.style.marginTop = '0px';
+                                  el.style.paddingTop = '0px';
+                                  el.style.pageBreakBefore = 'auto';
+                                  el.style.breakBefore = 'auto';
+                                  resetBreakProps(el);
+                                };
+                                const first = root.firstElementChild;
+                                zeroOut(first);
+                                if (first && first.firstElementChild) {
+                                  removed += clearInlineBreaks(first);
+                                  zeroOut(first.firstElementChild);
+                                }
+                                if (first) {
+                                  Array.from(first.querySelectorAll('[style*="break"],[style*="page-break"],[style*="column-break"]'))
+                                    .forEach(resetBreakProps);
+                                  if (first.classList && first.classList.contains('forwarded-header-block')) {
+                                    const snippet = (first.textContent || '').slice(0, 200).toLowerCase();
+                                    const hasForwardLabels = snippet.includes('from:') && snippet.indexOf('from:') < 60;
+                                    if (!hasForwardLabels) {
+                                      while (first.firstChild) {
+                                        root.insertBefore(first.firstChild, first);
+                                      }
+                                      first.remove();
+                                      removed += clearInlineBreaks(root);
+                                    }
+                                  }
+                                }
+
+                                removed += clearInlineBreaks(root);
+                                return { removed };
+                              } catch (error) {
+                                return { removed: 0, error: String(error) };
+                              }
+                            }
+                        """
+                    )
+                    logger.info(f"LEADING WHITESPACE CLEANUP: {cleanup_result}")
+                except Exception as cleanup_error:
+                    logger.warning(f"Leading whitespace cleanup failed: {cleanup_error}")
+
+                try:
+                    first_block_info = page.evaluate(
+                        r"""
+                            () => {
+                              try {
+                                const root = document.querySelector('.email-body');
+                                if (!root) {
+                                  return { reason: 'missing-root' };
+                                }
+                                const first = root.firstElementChild;
+                                if (!first) {
+                                  return { reason: 'no-first-element' };
+                                }
+                                const style = window.getComputedStyle(first);
+                                const rect = first.getBoundingClientRect();
+                                return {
+                                  tag: first.tagName,
+                                  classes: Array.from(first.classList || []),
+                                  marginTop: style.marginTop,
+                                  paddingTop: style.paddingTop,
+                                  breakBefore: style.breakBefore || style.pageBreakBefore || null,
+                                  offsetTop: first.offsetTop || 0,
+                                  bboxTop: rect ? rect.top : null,
+                                  htmlPreview: (first.innerHTML || '').slice(0, 160)
+                                };
+                              } catch (error) {
+                                return { error: String(error) };
+                              }
+                            }
+                        """
+                    )
+                    logger.info(f"CONTENT START DIAGNOSTIC: {first_block_info}")
+                except Exception as diag_error:
+                    logger.warning(f"Content start inspection failed: {diag_error}")
 
                 # Use shared page size/margins and reduce margins to allow inline media under header
                 page_format, page_margins = resolve_pdf_layout_settings()
