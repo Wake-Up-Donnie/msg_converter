@@ -103,3 +103,8 @@ tmp/twemoji_cache/**
 
 # Ignore local test output
 test-output/
+
+# Database files (contain runtime user data)
+*.db
+*.sqlite
+*.sqlite3
