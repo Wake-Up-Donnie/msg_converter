@@ -1,0 +1,14 @@
+{
+  "webhook_id": "we_1ST5prIHRR0HEy4Bt63jtskC",
+  "webhook_url": "https://4mk9j0sn5i.execute-api.us-east-1.amazonaws.com/dev/api/stripe/webhook",
+  "webhook_secret": "whsec_Ajss2cst6MK87PHNOoATeHox72RtxFmm",
+  "environment": "dev",
+  "enabled_events": [
+    "checkout.session.completed",
+    "customer.subscription.created",
+    "customer.subscription.updated",
+    "customer.subscription.deleted",
+    "invoice.payment_succeeded",
+    "invoice.payment_failed"
+  ]
+}

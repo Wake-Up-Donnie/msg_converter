@@ -279,7 +279,7 @@ Resources:
           FRONTEND_URL: !If
             - HasCustomDomain
             - !Sub 'https://${FrontendDomain}'
-            - !Sub 'https://${CloudFrontDistribution.DomainName}'
+            - 'PLACEHOLDER_CLOUDFRONT_URL'
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
@@ -328,7 +328,7 @@ Resources:
           FRONTEND_URL: !If
             - HasCustomDomain
             - !Sub 'https://${FrontendDomain}'
-            - !Sub 'https://${CloudFrontDistribution.DomainName}'
+            - 'PLACEHOLDER_CLOUDFRONT_URL'
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref UsersTable

@@ -146,12 +146,12 @@ sam deploy \
         Environment=${ENVIRONMENT} \
         StripeSecretKey="${STRIPE_SECRET_KEY}" \
         StripePublishableKey="${STRIPE_PUBLISHABLE_KEY}" \
-        StripeWebhookSecret="" \
         MonthlyPriceId="${MONTHLY_PRICE_ID}" \
         YearlyPriceId="${YEARLY_PRICE_ID}" \
         JWTSecretKey="${JWT_SECRET_KEY}" \
     --capabilities CAPABILITY_IAM \
     --region ${REGION} \
+    --resolve-s3 \
     --no-fail-on-empty-changeset
 
 echo -e "${GREEN}✓ Backend deployed${NC}"
@@ -191,6 +191,22 @@ WEBHOOK_URL=$(aws cloudformation describe-stacks \
     --output text)
 
 echo -e "${GREEN}✓ Stack outputs retrieved${NC}"
+echo ""
+
+# Step 3.5: Update Lambda functions with CloudFront URL
+echo -e "${YELLOW}Step 3.5: Updating Lambda functions with CloudFront URL...${NC}"
+
+aws lambda update-function-configuration \
+    --function-name "landing-checkout-${ENVIRONMENT}" \
+    --environment "Variables={ENVIRONMENT=${ENVIRONMENT},USERS_TABLE=subscription-users-${ENVIRONMENT},STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY},MONTHLY_PRICE_ID=${MONTHLY_PRICE_ID},YEARLY_PRICE_ID=${YEARLY_PRICE_ID},SECRET_KEY=${JWT_SECRET_KEY},FRONTEND_URL=${CLOUDFRONT_URL}}" \
+    --region ${REGION} > /dev/null
+
+aws lambda update-function-configuration \
+    --function-name "landing-portal-${ENVIRONMENT}" \
+    --environment "Variables={ENVIRONMENT=${ENVIRONMENT},USERS_TABLE=subscription-users-${ENVIRONMENT},STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY},MONTHLY_PRICE_ID=${MONTHLY_PRICE_ID},YEARLY_PRICE_ID=${YEARLY_PRICE_ID},SECRET_KEY=${JWT_SECRET_KEY},FRONTEND_URL=${CLOUDFRONT_URL}}" \
+    --region ${REGION} > /dev/null
+
+echo -e "${GREEN}✓ Lambda functions updated${NC}"
 echo ""
 
 # Step 4: Build and deploy frontend

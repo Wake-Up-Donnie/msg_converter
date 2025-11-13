@@ -1,0 +1,15 @@
+Deployment Information - dev
+Generated: Thu Nov 13 10:54:56 PST 2025
+
+Frontend URL: https://d2sgirqk88lhjr.cloudfront.net
+API URL: https://4mk9j0sn5i.execute-api.us-east-1.amazonaws.com/dev
+Webhook URL: https://4mk9j0sn5i.execute-api.us-east-1.amazonaws.com/dev/api/stripe/webhook
+Frontend Bucket: subscription-landing-dev-395096735234
+CloudFront Distribution ID: E2FS0P23JRSSFE
+Stack Name: subscription-landing-dev
+Region: us-east-1
+
+Next Steps:
+1. Configure Stripe webhook at: https://dashboard.stripe.com/webhooks
+2. Test the application at: https://d2sgirqk88lhjr.cloudfront.net
+3. Register a test user and try the subscription flow
