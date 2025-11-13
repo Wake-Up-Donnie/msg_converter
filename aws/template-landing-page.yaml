@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Subscription Landing Page with Stripe Integration
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Environment name for resource naming
+
+  StripeSecretKey:
+    Type: String
+    NoEcho: true
+    Description: Stripe secret key (sk_test_* or sk_live_*)
+
+  StripePublishableKey:
+    Type: String
+    Description: Stripe publishable key (pk_test_* or pk_live_*)
+
+  StripeWebhookSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Stripe webhook signing secret (configure after first deployment)
+
+  MonthlyPriceId:
+    Type: String
+    Description: Stripe price ID for monthly plan
+
+  YearlyPriceId:
+    Type: String
+    Description: Stripe price ID for yearly plan
+
+  JWTSecretKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Secret key for JWT token signing (leave empty to auto-generate)
+
+  FrontendDomain:
+    Type: String
+    Default: ''
+    Description: Optional custom domain for frontend (e.g., app.example.com)
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref FrontendDomain, '']]
+  HasWebhookSecret: !Not [!Equals [!Ref StripeWebhookSecret, '']]
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.12
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        USERS_TABLE: !Ref UsersTable
+        STRIPE_SECRET_KEY: !Ref StripeSecretKey
+        MONTHLY_PRICE_ID: !Ref MonthlyPriceId
+        YEARLY_PRICE_ID: !Ref YearlyPriceId
+        SECRET_KEY: !If
+          - HasWebhookSecret
+          - !Ref JWTSecretKey
+          - !Sub '${AWS::StackName}-${AWS::AccountId}-secret'
+
+Resources:
+  # DynamoDB Users Table
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'subscription-users-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SubscriptionLanding
+
+  # S3 Bucket for Frontend Hosting
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'subscription-landing-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  # Bucket Policy for Frontend
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: APIOrigin
+            DomainName: !Sub '${LandingPageAPI}.execute-api.${AWS::Region}.amazonaws.com'
+            OriginPath: !Sub '/${Environment}'
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases: !If [HasCustomDomain, [!Ref FrontendDomain], !Ref AWS::NoValue]
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: APIOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT]
+            CachedMethods: [GET, HEAD]
+            ForwardedValues:
+              QueryString: true
+              Headers: ['Authorization', 'Content-Type', 'Stripe-Signature']
+              Cookies:
+                Forward: none
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+        Comment: !Sub 'Subscription Landing Page - ${Environment}'
+        PriceClass: PriceClass_100
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # API Gateway
+  LandingPageAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'subscription-landing-api-${Environment}'
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+        AllowHeaders: "'Content-Type,Authorization,Stripe-Signature'"
+        AllowOrigin: "'*'"
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+
+  # Lambda: User Registration
+  RegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'landing-register-${Environment}'
+      CodeUri: ../landing-backend/
+      Handler: handlers.auth_handler.register_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        RegisterAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LandingPageAPI
+            Path: /api/auth/register
+            Method: post
+
+  # Lambda: User Login
+  LoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'landing-login-${Environment}'
+      CodeUri: ../landing-backend/
+      Handler: handlers.auth_handler.login_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        LoginAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LandingPageAPI
+            Path: /api/auth/login
+            Method: post
+
+  # Lambda: Token Verification
+  VerifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'landing-verify-${Environment}'
+      CodeUri: ../landing-backend/
+      Handler: handlers.auth_handler.verify_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        VerifyAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LandingPageAPI
+            Path: /api/auth/verify
+            Method: get
+
+  # Lambda: Usage Check
+  UsageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'landing-usage-${Environment}'
+      CodeUri: ../landing-backend/
+      Handler: handlers.auth_handler.usage_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        UsageAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LandingPageAPI
+            Path: /api/auth/usage
+            Method: get
+
+  # Lambda: Create Checkout Session
+  CheckoutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'landing-checkout-${Environment}'
+      CodeUri: ../landing-backend/
+      Handler: handlers.stripe_handler.checkout_handler
+      Environment:
+        Variables:
+          FRONTEND_URL: !If
+            - HasCustomDomain
+            - !Sub 'https://${FrontendDomain}'
+            - !Sub 'https://${CloudFrontDistribution.DomainName}'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        CheckoutAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LandingPageAPI
+            Path: /api/stripe/create-checkout-session
+            Method: post
+
+  # Lambda: Stripe Webhook Handler
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'landing-webhook-${Environment}'
+      CodeUri: ../landing-backend/
+      Handler: handlers.stripe_handler.webhook_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          STRIPE_WEBHOOK_SECRET: !If
+            - HasWebhookSecret
+            - !Ref StripeWebhookSecret
+            - 'CONFIGURE_AFTER_DEPLOYMENT'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        WebhookAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LandingPageAPI
+            Path: /api/stripe/webhook
+            Method: post
+
+  # Lambda: Customer Portal
+  PortalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'landing-portal-${Environment}'
+      CodeUri: ../landing-backend/
+      Handler: handlers.stripe_handler.portal_handler
+      Environment:
+        Variables:
+          FRONTEND_URL: !If
+            - HasCustomDomain
+            - !Sub 'https://${FrontendDomain}'
+            - !Sub 'https://${CloudFrontDistribution.DomainName}'
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        PortalAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LandingPageAPI
+            Path: /api/stripe/create-portal-session
+            Method: post
+
+  # CloudWatch Log Groups
+  RegisterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/landing-register-${Environment}'
+      RetentionInDays: 30
+
+  LoginLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/landing-login-${Environment}'
+      RetentionInDays: 30
+
+  VerifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/landing-verify-${Environment}'
+      RetentionInDays: 30
+
+  CheckoutLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/landing-checkout-${Environment}'
+      RetentionInDays: 30
+
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/landing-webhook-${Environment}'
+      RetentionInDays: 30
+
+  PortalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/landing-portal-${Environment}'
+      RetentionInDays: 30
+
+Outputs:
+  APIGatewayURL:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${LandingPageAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-api-url'
+
+  CloudFrontURL:
+    Description: 'CloudFront distribution URL for frontend'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-frontend-url'
+
+  CustomDomainURL:
+    Condition: HasCustomDomain
+    Description: 'Custom domain URL'
+    Value: !Sub 'https://${FrontendDomain}'
+    Export:
+      Name: !Sub '${AWS::StackName}-custom-domain-url'
+
+  FrontendBucketName:
+    Description: 'S3 bucket name for frontend hosting'
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-frontend-bucket'
+
+  UsersTableName:
+    Description: 'DynamoDB users table name'
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-users-table'
+
+  WebhookURL:
+    Description: 'Stripe webhook endpoint URL (configure this in Stripe Dashboard)'
+    Value: !Sub 'https://${LandingPageAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/api/stripe/webhook'
+
+  CloudFrontDistributionId:
+    Description: 'CloudFront distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-distribution-id'
+
+  DeploymentCommands:
+    Description: 'Commands to deploy frontend'
+    Value: !Sub |
+      # Build and deploy frontend:
+      cd landing-frontend
+      REACT_APP_API_URL=https://${LandingPageAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment} \
+      REACT_APP_STRIPE_PUBLISHABLE_KEY=${StripePublishableKey} \
+      npm run build
+
+      aws s3 sync build/ s3://${FrontendBucket}/ --delete
+      aws cloudfront create-invalidation --distribution-id ${CloudFrontDistribution} --paths "/*"

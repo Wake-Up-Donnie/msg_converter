@@ -1,0 +1,249 @@
+.try-app {
+  min-height: 100vh;
+  background: #f8f9fa;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-nav {
+  background: white;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  padding: 1rem 0;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.app-nav .nav-container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.app-nav h2 {
+  color: #667eea;
+  font-size: 1.5rem;
+}
+
+.app-nav .nav-links {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.usage-indicator {
+  background: #f0f0f0;
+  padding: 0.5rem 1rem;
+  border-radius: 20px;
+  font-weight: 500;
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.usage-indicator.unlimited {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+.app-nav .nav-links a {
+  color: #333;
+  font-weight: 500;
+  transition: all 0.3s;
+}
+
+.app-nav .nav-links a:hover {
+  color: #667eea;
+}
+
+.app-nav .nav-button {
+  padding: 0.5rem 1.5rem;
+  background: #667eea;
+  color: white;
+  border-radius: 8px;
+  font-weight: 500;
+  transition: all 0.3s;
+}
+
+.app-nav .nav-button:hover {
+  background: #5568d3;
+}
+
+.app-container {
+  flex: 1;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 2rem;
+  width: 100%;
+}
+
+.app-info {
+  text-align: center;
+  margin-bottom: 2rem;
+}
+
+.app-info h1 {
+  font-size: 2rem;
+  color: #333;
+  margin-bottom: 0.5rem;
+}
+
+.quota-info {
+  color: #666;
+  font-size: 1rem;
+}
+
+.upgrade-link {
+  color: #667eea;
+  font-weight: 600;
+  margin-left: 0.3rem;
+}
+
+.app-frame {
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+  min-height: 600px;
+}
+
+.converter-iframe {
+  width: 100%;
+  height: 700px;
+  border: none;
+  display: block;
+}
+
+.converter-alternative {
+  padding: 2rem;
+  text-align: center;
+  background: #f8f9fa;
+  border-top: 2px solid #e0e0e0;
+}
+
+.converter-alternative p {
+  color: #666;
+  margin-bottom: 1rem;
+}
+
+.open-new-tab {
+  display: inline-block;
+  padding: 0.8rem 2rem;
+  background: #667eea;
+  color: white;
+  border-radius: 8px;
+  font-weight: 600;
+  transition: all 0.3s;
+}
+
+.open-new-tab:hover {
+  background: #5568d3;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+}
+
+.low-quota-banner {
+  margin-top: 1.5rem;
+  padding: 1rem 2rem;
+  background: #fff3e0;
+  border: 2px solid #ff9800;
+  border-radius: 10px;
+  text-align: center;
+}
+
+.low-quota-banner p {
+  color: #333;
+  font-weight: 500;
+}
+
+.low-quota-banner a {
+  color: #667eea;
+  font-weight: 600;
+}
+
+/* Quota Exceeded */
+.quota-exceeded {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 100px);
+  padding: 2rem;
+}
+
+.quota-message {
+  text-align: center;
+  max-width: 600px;
+  background: white;
+  padding: 3rem;
+  border-radius: 16px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+}
+
+.quota-icon {
+  font-size: 4rem;
+  margin-bottom: 1rem;
+}
+
+.quota-message h1 {
+  font-size: 2rem;
+  color: #333;
+  margin-bottom: 1rem;
+}
+
+.quota-message p {
+  color: #666;
+  font-size: 1.1rem;
+  line-height: 1.6;
+  margin-bottom: 1rem;
+}
+
+.upgrade-options {
+  margin: 2rem 0;
+}
+
+.upgrade-button {
+  padding: 1rem 2.5rem;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 1.1rem;
+  transition: all 0.3s;
+}
+
+.upgrade-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(102, 126, 234, 0.3);
+}
+
+.reset-info {
+  margin-top: 2rem;
+  padding-top: 2rem;
+  border-top: 1px solid #e0e0e0;
+}
+
+.reset-info p {
+  font-size: 0.9rem;
+  color: #999;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .converter-iframe {
+    height: 500px;
+  }
+
+  .app-info h1 {
+    font-size: 1.5rem;
+  }
+
+  .quota-message {
+    padding: 2rem;
+  }
+
+  .quota-message h1 {
+    font-size: 1.75rem;
+  }
+}
