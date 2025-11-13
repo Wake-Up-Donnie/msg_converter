@@ -1,0 +1,24 @@
+{
+  "description": "Whitelist configuration for free unlimited users",
+  "whitelisted_emails": [
+    {
+      "email": "tbobik91@gmail.com",
+      "name": "Primary User",
+      "notes": "Free unlimited access - no expiration"
+    }
+  ],
+  "instructions": {
+    "how_to_add_users": [
+      "1. Add email addresses to the 'whitelisted_emails' array above",
+      "2. Each entry should have: email (required), name (optional), notes (optional)",
+      "3. Run: cdk deploy",
+      "4. Users will be automatically created in DynamoDB with random passwords",
+      "5. Check CloudWatch Logs for the generated passwords"
+    ],
+    "example_entry": {
+      "email": "newuser@example.com",
+      "name": "New User Name",
+      "notes": "Free access granted on YYYY-MM-DD"
+    }
+  }
+}
