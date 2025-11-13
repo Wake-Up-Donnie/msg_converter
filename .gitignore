@@ -108,3 +108,7 @@ test-output/
 *.db
 *.sqlite
 *.sqlite3
+
+# Whitelisted user credentials (contain passwords)
+whitelisted_users_credentials_*.txt
+*_credentials.txt
