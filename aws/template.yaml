@@ -152,6 +152,39 @@ Resources:
       QueueName: !Sub 'eml-converter-dlq-${Environment}'
       MessageRetentionPeriod: 1209600  # 14 days
 
+  # DynamoDB table for user management and subscriptions
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'eml-converter-users-${Environment}'
+      BillingMode: PAY_PER_REQUEST  # On-demand pricing for variable usage
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH  # Partition key (primary key)
+      GlobalSecondaryIndexes:
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: eml-converter
+
   # ECR Repository for Lambda container
   ECRRepository:
     Type: AWS::ECR::Repository
@@ -190,10 +223,14 @@ Resources:
           ENVIRONMENT: !Ref Environment
           APP_PASSWORD: !If [HasPassword, !Ref AppPassword, !Ref AWS::NoValue]
           PLAYWRIGHT_BROWSERS_PATH: "/var/lang/playwright/browsers"
+          USERS_TABLE: !Ref UsersTable
+          AWS_REGION_NAME: !Ref AWS::Region
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref TempFilesBucket
         - CloudWatchLogsFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -343,6 +380,12 @@ Outputs:
     Value: !Ref EMLConverterFunction
     Export:
       Name: !Sub '${AWS::StackName}-lambda-function'
+
+  UsersTableName:
+    Description: 'DynamoDB table name for user management'
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-users-table'
 
   DeploymentCommands:
     Description: 'Commands to deploy frontend to S3'
